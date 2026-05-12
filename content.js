@@ -78,6 +78,7 @@
   let lastCandidateSignature = "";
   let lastStatusText = "";
   let lastEnabledState = null;
+  let displayDebugRowsLogged = 0;
   const MIN_APPLY_INTERVAL_MS = 500;
   const rowStateCache = new WeakMap();
   const rowSummaryMap = new WeakMap();
@@ -969,6 +970,10 @@
     document.querySelectorAll(`.${DEBUG_OUTLINE_CLASS}`).forEach((element) => {
       updateClassIfNeeded(element, DEBUG_OUTLINE_CLASS, false);
     });
+
+    document.querySelectorAll(".dat-helper-company-cell").forEach((element) => {
+      updateClassIfNeeded(element, "dat-helper-company-cell", false);
+    });
   }
 
   function clearExtensionNodes() {
@@ -1201,32 +1206,79 @@
 
   function buildRowSummaryHash(loadData) {
     return [
-      loadData.totalMiles ?? "",
-      Number.isFinite(loadData.rpm) ? loadData.rpm.toFixed(2) : "",
-      Number.isFinite(loadData.allInRpm) ? loadData.allInRpm.toFixed(2) : "",
-      Number.isFinite(loadData.emptyMiles) ? Math.round(loadData.emptyMiles) : ""
+      Number.isFinite(loadData.totalMiles) ? Math.round(loadData.totalMiles) : "",
+      Number.isFinite(loadData.allInRpm) ? loadData.allInRpm.toFixed(2) : ""
     ].join("|");
   }
 
-  function buildRowSummaryMarkup(loadData) {
+  function formatDisplayMiles(value) {
+    return Number.isFinite(value) && value > 0 ? Math.round(value).toLocaleString("en-US") : "";
+  }
+
+  function formatDisplayRate(value) {
+    return Number.isFinite(value) && value > 0 ? value.toFixed(2) : "";
+  }
+
+  function getAvailableInlineSpace(target) {
+    if (!(target instanceof HTMLElement)) {
+      return 0;
+    }
+
+    const rect = target.getBoundingClientRect();
+    return rect ? rect.width : 0;
+  }
+
+  function chooseBadgeTextAndClass(target, loadData) {
+    const available = getAvailableInlineSpace(target);
+    const totalMiles = Number.isFinite(loadData.totalMiles) ? String(Math.round(loadData.totalMiles)) : null;
+    const rpm = Number.isFinite(loadData.rpm) ? loadData.rpm.toFixed(2) : null;
+    const allInRpm = Number.isFinite(loadData.allInRpm) ? loadData.allInRpm.toFixed(2) : null;
+
+    if (available >= 240) {
+      return {
+        available,
+        className: "",
+        mode: "full",
+        values: { totalMiles, rpm, allInRpm }
+      };
+    }
+
+    if (available >= 185) {
+      return {
+        available,
+        className: "dat-helper-compact",
+        mode: "compact",
+        values: { totalMiles, rpm, allInRpm }
+      };
+    }
+
+    return {
+      available,
+      className: "dat-helper-compact dat-helper-two-line",
+      mode: "two-line",
+      values: { totalMiles, rpm, allInRpm }
+    };
+  }
+
+  function buildSummaryItemMarkup(label, value) {
+    return `<span class="dat-helper-item"><span class="dat-helper-muted">${label}</span><strong class="dat-helper-value">${value}</strong></span>`;
+  }
+
+  function buildRowSummaryMarkup(loadData, displayMode) {
+    const totalMiles = Number.isFinite(loadData.totalMiles) ? String(Math.round(loadData.totalMiles)) : null;
+    const allInRpm = Number.isFinite(loadData.allInRpm) ? loadData.allInRpm.toFixed(2) : null;
     const items = [];
 
-    if (Number.isFinite(loadData.totalMiles)) {
-      items.push(
-        `<span class="dat-helper-item"><span class="dat-helper-muted">T</span> <span class="dat-helper-value">${Math.round(loadData.totalMiles)}</span></span>`
-      );
+    if (displayMode !== "ai-only" && totalMiles) {
+      items.push(buildSummaryItemMarkup(displayMode === "full" ? "Total" : "T", totalMiles));
     }
 
-    if (Number.isFinite(loadData.rpm)) {
-      items.push(
-        `<span class="dat-helper-item"><span class="dat-helper-muted">R</span> <span class="dat-helper-value">${loadData.rpm.toFixed(2)}</span></span>`
-      );
+    if (allInRpm) {
+      items.push(buildSummaryItemMarkup(displayMode === "full" ? "All-in" : "AI", allInRpm));
     }
 
-    if (Number.isFinite(loadData.allInRpm)) {
-      items.push(
-        `<span class="dat-helper-item"><span class="dat-helper-muted">AI</span> <span class="dat-helper-value">${loadData.allInRpm.toFixed(2)}</span></span>`
-      );
+    if (!items.length) {
+      return "";
     }
 
     return items.join(`<span class="dat-helper-separator">|</span>`);
@@ -1269,6 +1321,677 @@
     return { target: row, floating: true };
   }
 
+  function findReadableInlineSummaryPlacementTarget(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const cells = [...row.querySelectorAll(".table-cell")].filter((cell) => cell instanceof HTMLElement);
+    const seenTargets = new Set();
+    const preferredCandidates = [];
+    const addCandidate = (target, floating = false) => {
+      if (!(target instanceof HTMLElement) || seenTargets.has(target) || isBadPlacementTarget(target)) {
+        return;
+      }
+
+      seenTargets.add(target);
+      preferredCandidates.push({
+        target,
+        floating,
+        available: getAvailableInlineSpace(target)
+      });
+    };
+
+    const trailingDashCell = [...cells].reverse().find((cell) => /^\s*[â€“-]\s*$/.test(getCleanElementText(cell)));
+    addCandidate(trailingDashCell);
+
+    [...cells].reverse().forEach((cell) => {
+      addCandidate(cell);
+    });
+
+    addCandidate(
+      row.querySelector('[data-test="load-company-cell"]')?.closest(".table-cell")
+    );
+    addCandidate(
+      row.querySelector('[data-test="load-cs-dtp-cell"]')?.closest(".table-cell")
+    );
+    addCandidate(row.querySelector(".row-cells"));
+
+    const roomyCandidate = preferredCandidates.find((candidate) => candidate.available >= 185);
+    if (roomyCandidate) {
+      return roomyCandidate;
+    }
+
+    const wrapCandidate = preferredCandidates.find((candidate) => candidate.available >= 145);
+    if (wrapCandidate) {
+      return wrapCandidate;
+    }
+
+    const widestCandidate = preferredCandidates.sort((left, right) => right.available - left.available)[0];
+    if (widestCandidate && widestCandidate.available >= 120) {
+      return widestCandidate;
+    }
+
+    const rowAvailable = getAvailableInlineSpace(row);
+    if (rowAvailable >= 240) {
+      return { target: row, floating: true, available: rowAvailable };
+    }
+
+    return null;
+  }
+
+  function findCompanyCell(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const looksLikeCompanyCell = (cell) => {
+      if (!(cell instanceof HTMLElement)) {
+        return false;
+      }
+
+      const text = getCleanElementText(cell);
+      if (!text) {
+        return false;
+      }
+
+      if (/\b\d{2,3}\s*CS\b/i.test(text) || /\b\d{1,3}\s*DTP\b/i.test(text)) {
+        return false;
+      }
+
+      return (
+        /\(\d{3}\)\s*\d{3}-\d{4}/.test(text) ||
+        /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(text)
+      );
+    };
+
+    const explicitCell = row.querySelector('[data-test="load-company-cell"]')?.closest(".table-cell");
+    if (looksLikeCompanyCell(explicitCell)) {
+      return explicitCell;
+    }
+
+    return [...row.querySelectorAll(".table-cell")].find((cell) => looksLikeCompanyCell(cell)) || null;
+  }
+
+  function findScoreCell(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const explicitScore = row.querySelector('[data-test="load-cs-dtp-cell"]')?.closest(".table-cell");
+    if (explicitScore instanceof HTMLElement) {
+      return explicitScore;
+    }
+
+    return [...row.querySelectorAll(".table-cell")].find((cell) => {
+      if (!(cell instanceof HTMLElement)) {
+        return false;
+      }
+
+      const text = getCleanElementText(cell);
+      return /\b\d{2,3}\s*CS\b/i.test(text) || /\b\d{1,3}\s*DTP\b/i.test(text);
+    }) || null;
+  }
+
+  function findHelperGap(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const companyCell = findCompanyCell(row);
+    const scoreCell = findScoreCell(row);
+    if (!(companyCell instanceof HTMLElement) || !(scoreCell instanceof HTMLElement)) {
+      return null;
+    }
+
+    const rowRect = row.getBoundingClientRect();
+    const companyRect = companyCell.getBoundingClientRect();
+    const scoreRect = scoreCell.getBoundingClientRect();
+    const gapLeft = companyRect.right;
+    const gapRight = scoreRect.left;
+    const gapWidth = Math.floor(gapRight - gapLeft);
+    if (!rowRect || !companyRect || !scoreRect || gapWidth <= 0) {
+      return null;
+    }
+
+    return {
+      row,
+      rowRect,
+      companyCell,
+      companyRect,
+      scoreCell,
+      scoreRect,
+      gapLeft,
+      gapRight,
+      gapWidth
+    };
+  }
+
+  function findCompanyWrapper(companyCell) {
+    if (!(companyCell instanceof HTMLElement)) {
+      return null;
+    }
+
+    const wrapper =
+      companyCell.querySelector(".info-container") ||
+      companyCell.querySelector(".cell-container") ||
+      companyCell;
+    if (wrapper instanceof HTMLElement) {
+      wrapper.classList.add("dat-helper-company-wrapper");
+      return wrapper;
+    }
+
+    return companyCell;
+  }
+
+  function findCompanyContactContainer(companyCell) {
+    if (!(companyCell instanceof HTMLElement)) {
+      return null;
+    }
+
+    const explicitContact =
+      companyCell.querySelector('[data-test="load-contact-cell"]')?.closest(".contact-state") ||
+      companyCell.querySelector('[data-test="load-contact-cell"]')?.parentElement;
+    if (explicitContact instanceof HTMLElement) {
+      return explicitContact;
+    }
+
+    const contactLike = [...companyCell.querySelectorAll("a, span, div")].find((element) => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+
+      const text = getCleanElementText(element);
+      return (
+        /\(\d{3}\)\s*\d{3}-\d{4}/.test(text) ||
+        /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i.test(text)
+      );
+    });
+
+    return contactLike instanceof HTMLElement ? contactLike : null;
+  }
+
+  function findCompanyNameContainer(companyCell) {
+    if (!(companyCell instanceof HTMLElement)) {
+      return null;
+    }
+
+    const explicitName =
+      companyCell.querySelector('[data-test="load-company-cell"]') ||
+      companyCell.querySelector(".company-prefer-or-blocked .anchor") ||
+      companyCell.querySelector(".company-prefer-or-blocked");
+    if (explicitName instanceof HTMLElement) {
+      return explicitName;
+    }
+
+    const nameLike = [...companyCell.querySelectorAll("a, span, div")].find((element) => {
+      if (!(element instanceof HTMLElement)) {
+        return false;
+      }
+
+      const text = getCleanElementText(element);
+      if (!text) {
+        return false;
+      }
+
+      return !/\(\d{3}\)\s*\d{3}-\d{4}/.test(text) && !/@/.test(text);
+    });
+
+    return nameLike instanceof HTMLElement ? nameLike : null;
+  }
+
+  function findTrailingDashBadgeCell(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    return [...row.querySelectorAll(".table-cell")]
+      .filter((cell) => cell instanceof HTMLElement)
+      .reverse()
+      .find((cell) => {
+        const text = getCleanElementText(cell);
+        return /^\s*[â€“-]\s*$/.test(text) && !cell.querySelector('[data-test="load-cs-dtp-cell"]');
+      }) || null;
+  }
+
+  function getInlineSpaceAfterContact(companyCell, contactContainer) {
+    if (!(companyCell instanceof HTMLElement) || !(contactContainer instanceof HTMLElement)) {
+      return 0;
+    }
+
+    const cellRect = companyCell.getBoundingClientRect();
+    const contactRect = contactContainer.getBoundingClientRect();
+    if (!cellRect || !contactRect) {
+      return 0;
+    }
+
+    return Math.max(0, Math.floor(cellRect.right - contactRect.right - 8));
+  }
+
+  function badgeFitsWithinCell(badge, cell) {
+    if (!(badge instanceof HTMLElement) || !(cell instanceof HTMLElement)) {
+      return false;
+    }
+
+    const b = badge.getBoundingClientRect();
+    const c = cell.getBoundingClientRect();
+    return b.right <= c.right && b.left >= c.left;
+  }
+
+  function hasInlineRoom(target, badgeWidth) {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+
+    const targetRect = target.getBoundingClientRect();
+    const parentRect = target.parentElement?.getBoundingClientRect();
+    if (!targetRect || !parentRect) {
+      return false;
+    }
+
+    return parentRect.right - targetRect.right >= badgeWidth + 8;
+  }
+
+  function isSingleLineElement(element) {
+    if (!(element instanceof HTMLElement)) {
+      return false;
+    }
+
+    const rect = element.getBoundingClientRect();
+    const computed = window.getComputedStyle(element);
+    const parsedLineHeight = Number.parseFloat(computed.lineHeight);
+    const fallbackLineHeight = Number.parseFloat(computed.fontSize) * 1.4;
+    const lineHeight = Number.isFinite(parsedLineHeight) ? parsedLineHeight : fallbackLineHeight;
+    return rect.height <= lineHeight + 3;
+  }
+
+  function rectsIntersect(left, right) {
+    return !(
+      left.right <= right.left ||
+      left.left >= right.right ||
+      left.bottom <= right.top ||
+      left.top >= right.bottom
+    );
+  }
+
+  function rectsOverlap(left, right) {
+    return rectsIntersect(left, right);
+  }
+
+  function badgeOverlapsExistingText(badge, row) {
+    if (!(badge instanceof HTMLElement) || !(row instanceof HTMLElement)) {
+      return true;
+    }
+
+    const badgeRect = badge.getBoundingClientRect();
+    const protectedSelectors = [
+      '[data-test="load-company-cell"]',
+      '[data-test="load-contact-cell"]',
+      '[data-test="load-cs-dtp-cell"]',
+      TEMPLATE_FIELD_SELECTORS.rateCell,
+      TEMPLATE_FIELD_SELECTORS.tripCell,
+      TEMPLATE_FIELD_SELECTORS.deadheadOriginCell,
+      TEMPLATE_FIELD_SELECTORS.deadheadDestinationCell,
+      TEMPLATE_FIELD_SELECTORS.pickupCell
+    ];
+
+    return protectedSelectors.some((selector) => {
+      return [...row.querySelectorAll(selector)].some((element) => {
+        if (!(element instanceof HTMLElement) || badge.contains(element) || element.contains(badge)) {
+          return false;
+        }
+
+        const text = getCleanElementText(element);
+        if (!text) {
+          return false;
+        }
+
+        return rectsIntersect(badgeRect, element.getBoundingClientRect());
+      });
+    });
+  }
+
+  function buildTwoLineTotalRpmMarkup(loadData) {
+    const totalMiles = formatDisplayMiles(loadData.totalMiles);
+    const totalRpm = formatDisplayRate(loadData.allInRpm);
+    if (!totalMiles || !totalRpm) {
+      return "";
+    }
+
+    return [
+      `<div><span class="dat-helper-label">T</span> <strong class="dat-helper-value">${totalMiles}</strong></div>`,
+      `<div><span class="dat-helper-label">R</span> <strong class="dat-helper-value">${totalRpm}</strong></div>`
+    ].join("");
+  }
+
+  function logDisplayDebugRow(loadData, result) {
+    if (displayDebugRowsLogged >= 5) {
+      return;
+    }
+
+    displayDebugRowsLogged += 1;
+    console.log("[DAT Helper Display]", `row ${displayDebugRowsLogged}`, {
+      price: loadData.price,
+      tripMiles: loadData.tripMiles,
+      emptyMiles: loadData.emptyMiles,
+      totalMiles: loadData.totalMiles,
+      totalRpm: loadData.allInRpm,
+      renderAttempted: result.renderAttempted,
+      placement: result.placement || null,
+      skippedReason: result.skippedReason || null
+    });
+  }
+
+  function renderTotalRpmHelper(row, loadData) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const existing = getExistingRowSummary(row);
+    const clearSummary = (noSafeHash = "") => {
+      if (noSafeHash) {
+        row.dataset.datHelperNoSafeBadgeHash = noSafeHash;
+      } else {
+        delete row.dataset.datHelperNoSafeBadgeHash;
+      }
+      row
+        .querySelectorAll(`[${EXTENSION_ATTRIBUTE}="true"][data-dat-helper-role="${ROW_SUMMARY_ROLE}"]`)
+        .forEach((node) => node.remove());
+      rowSummaryMap.delete(row);
+      if (row.dataset.datHelperOriginalPosition !== undefined) {
+        row.style.position = row.dataset.datHelperOriginalPosition || "";
+        delete row.dataset.datHelperOriginalPosition;
+      }
+    };
+
+    if (!Number.isFinite(loadData.totalMiles) || loadData.totalMiles <= 0) {
+      logDisplayDebugRow(loadData, {
+        renderAttempted: false,
+        skippedReason: "missing-total-miles"
+      });
+      return null;
+    }
+
+    if (!Number.isFinite(loadData.allInRpm) || loadData.allInRpm <= 0) {
+      logDisplayDebugRow(loadData, {
+        renderAttempted: false,
+        skippedReason: "missing-total-rpm"
+      });
+      return null;
+    }
+
+    const formattedMiles = formatDisplayMiles(loadData.totalMiles);
+    const formattedRate = formatDisplayRate(loadData.allInRpm);
+    if (!formattedMiles || !formattedRate) {
+      logDisplayDebugRow(loadData, {
+        renderAttempted: false,
+        skippedReason: "formatting-failed"
+      });
+      return null;
+    }
+
+    const baseHash = [formattedMiles, formattedRate].join("|");
+    const gap = findHelperGap(row);
+    let summary = existing;
+    if (!(summary instanceof HTMLElement)) {
+      summary = createHelperNode("div", ROW_SUMMARY_CLASS);
+      summary.dataset.datHelperRole = ROW_SUMMARY_ROLE;
+    }
+
+    const markup = buildTwoLineTotalRpmMarkup(loadData);
+    if (!markup) {
+      logDisplayDebugRow(loadData, {
+        renderAttempted: false,
+        skippedReason: "empty-markup"
+      });
+      return null;
+    }
+
+    const companyCell = findCompanyCell(row);
+    const scoreCell = findScoreCell(row);
+    if (!(companyCell instanceof HTMLElement)) {
+      clearSummary();
+      logDisplayDebugRow(loadData, {
+        renderAttempted: true,
+        skippedReason: "no-company-cell"
+      });
+      return null;
+    }
+
+    updateClassIfNeeded(companyCell, "dat-helper-company-cell", true);
+    if (window.getComputedStyle(companyCell).position === "static") {
+      companyCell.dataset.datHelperOriginalPosition = companyCell.style.position || "";
+      companyCell.style.position = "relative";
+    }
+
+    if (summary.parentElement !== companyCell) {
+      companyCell.appendChild(summary);
+    }
+
+    updateClassIfNeeded(summary, "dat-helper-inline", false);
+    updateClassIfNeeded(summary, "dat-helper-stacked", false);
+    updateClassIfNeeded(summary, "dat-helper-compact", false);
+    updateClassIfNeeded(summary, "dat-helper-two-line", false);
+    updateClassIfNeeded(summary, "dat-helper-floating", false);
+    summary.style.position = "absolute";
+    summary.style.right = "6px";
+    summary.style.left = "auto";
+    summary.style.top = "50%";
+    summary.style.transform = "translateY(-50%)";
+    summary.style.maxWidth = "none";
+    summary.innerHTML = markup;
+
+    let placement = "company-cell-right";
+    let placementCoordinate = 0;
+
+    if (gap && scoreCell instanceof HTMLElement) {
+      const minGapWidth = formattedMiles.length >= 5 || formattedRate.length >= 5 ? 66 : 54;
+      if (gap.gapWidth >= minGapWidth) {
+        if (summary.parentElement !== row) {
+          row.appendChild(summary);
+        }
+        if (window.getComputedStyle(row).position === "static") {
+          row.dataset.datHelperOriginalPosition = row.style.position || "";
+          row.style.position = "relative";
+        }
+        summary.style.left = `${Math.round(gap.gapLeft - gap.rowRect.left + 8)}px`;
+        summary.style.right = "auto";
+        placement = "gap-between-company-score";
+        placementCoordinate = Math.round(gap.gapLeft - gap.rowRect.left + 8);
+      }
+    }
+
+    const helperRect = summary.getBoundingClientRect();
+    const companyRect = companyCell.getBoundingClientRect();
+    const scoreRect = scoreCell?.getBoundingClientRect() || null;
+    const safe =
+      (placement !== "gap-between-company-score" || !badgeOverlapsExistingText(summary, row)) &&
+      (!scoreRect || !rectsOverlap(helperRect, scoreRect)) &&
+      (placement === "company-cell-right" || !rectsOverlap(helperRect, companyRect));
+
+    if (!safe) {
+      if (placement !== "company-cell-right") {
+        if (summary.parentElement !== companyCell) {
+          companyCell.appendChild(summary);
+        }
+        summary.style.right = "6px";
+        summary.style.left = "auto";
+        placement = "company-cell-right";
+        placementCoordinate = 0;
+      }
+    }
+
+    const finalRect = summary.getBoundingClientRect();
+    const finalSafe =
+      (placement !== "gap-between-company-score" || !badgeOverlapsExistingText(summary, row)) &&
+      (!scoreRect || !rectsOverlap(finalRect, scoreRect)) &&
+      finalRect.right <= companyRect.right + 1;
+
+    if (!finalSafe) {
+      clearSummary();
+      logDisplayDebugRow(loadData, {
+        renderAttempted: true,
+        placement,
+        skippedReason: "placement-overlap"
+      });
+      return null;
+    }
+
+    delete row.dataset.datHelperNoSafeBadgeHash;
+    rowSummaryMap.set(row, summary);
+    logDisplayDebugRow(loadData, {
+      renderAttempted: true,
+      placement
+    });
+    return {
+      node: summary,
+      hash: [baseHash, placement, placementCoordinate].join("|"),
+      markup
+    };
+  }
+
+  function buildMinimalBadgeText(loadData, tight = false) {
+    const parts = [];
+    if (Number.isFinite(loadData.totalMiles)) {
+      const miles = Math.round(loadData.totalMiles).toLocaleString("en-US");
+      parts.push(
+        buildSummaryItemMarkup(tight ? "T" : "T", tight ? miles.replace(/,/g, ",") : miles)
+      );
+    }
+
+    if (Number.isFinite(loadData.allInRpm)) {
+      parts.push(buildSummaryItemMarkup("AI", loadData.allInRpm.toFixed(2)));
+    }
+
+    if (!parts.length) {
+      return "";
+    }
+
+    return parts.join(`<span class="dat-helper-separator"> </span>`);
+  }
+
+  function findSafeInlineBadgeTarget(row) {
+    if (!(row instanceof HTMLElement)) {
+      return [];
+    }
+
+    const companyCell = findCompanyCell(row);
+    const targets = [];
+    const contact = findCompanyContactContainer(companyCell);
+    if (contact instanceof HTMLElement && isSingleLineElement(contact)) {
+      targets.push({
+        key: "company-contact",
+        target: contact,
+        cell: companyCell
+      });
+    }
+
+    const companyName = findCompanyNameContainer(companyCell);
+    if (companyName instanceof HTMLElement && isSingleLineElement(companyName)) {
+      targets.push({
+        key: "company-name",
+        target: companyName,
+        cell: companyCell
+      });
+    }
+
+    const dashCell = findTrailingDashBadgeCell(row);
+    if (dashCell instanceof HTMLElement && !isBadPlacementTarget(dashCell)) {
+      targets.push({
+        key: "trailing-dash",
+        target: dashCell,
+        cell: dashCell
+      });
+    }
+
+    return targets.filter((candidate) => candidate.cell instanceof HTMLElement);
+  }
+
+  function renderMinimalBadge(row, loadData) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const existing = getExistingRowSummary(row);
+    const baseHash = buildRowSummaryHash(loadData);
+    const candidates = findSafeInlineBadgeTarget(row);
+    if (!candidates.length) {
+      row.dataset.datHelperNoSafeBadgeHash = baseHash;
+      existing?.remove();
+      rowSummaryMap.delete(row);
+      return null;
+    }
+
+    let summary = existing;
+    if (!(summary instanceof HTMLElement)) {
+      summary = createHelperNode("span", ROW_SUMMARY_CLASS);
+      summary.dataset.datHelperRole = ROW_SUMMARY_ROLE;
+    }
+
+    const markUnsafe = (baseHash) => {
+      row.dataset.datHelperNoSafeBadgeHash = baseHash;
+      summary.remove();
+      rowSummaryMap.delete(row);
+    };
+
+    if (row.dataset.datHelperNoSafeBadgeHash === baseHash) {
+      existing?.remove();
+      rowSummaryMap.delete(row);
+      return null;
+    }
+
+    const variants = [
+      { key: "standard", markup: buildMinimalBadgeText(loadData, false) },
+      { key: "tight", markup: buildMinimalBadgeText(loadData, true) }
+    ].filter((variant) => Boolean(variant.markup));
+
+    for (const candidate of candidates) {
+      for (const variant of variants) {
+        const beforeHeight = row.getBoundingClientRect().height;
+
+        if (summary.parentElement !== candidate.target) {
+          candidate.target.appendChild(summary);
+        }
+
+        updateClassIfNeeded(summary, "dat-helper-inline", true);
+        updateClassIfNeeded(summary, "dat-helper-stacked", false);
+        updateClassIfNeeded(summary, "dat-helper-compact", false);
+        updateClassIfNeeded(summary, "dat-helper-two-line", false);
+        updateClassIfNeeded(summary, "dat-helper-floating", false);
+        summary.style.maxWidth = "max-content";
+        summary.innerHTML = variant.markup;
+
+        const badgeWidth = summary.getBoundingClientRect().width;
+        const companyCell = candidate.cell;
+        const creditRect = row
+          .querySelector('[data-test="load-cs-dtp-cell"]')
+          ?.getBoundingClientRect();
+        const badgeRect = summary.getBoundingClientRect();
+        const afterHeight = row.getBoundingClientRect().height;
+
+        const safe =
+          hasInlineRoom(candidate.target, badgeWidth) &&
+          badgeFitsWithinCell(summary, companyCell) &&
+          afterHeight <= beforeHeight + 4 &&
+          (!creditRect || !rectsIntersect(badgeRect, creditRect)) &&
+          !badgeOverlapsExistingText(summary, row);
+
+        if (safe) {
+          delete row.dataset.datHelperNoSafeBadgeHash;
+          rowSummaryMap.set(row, summary);
+          return {
+            node: summary,
+            hash: [baseHash, variant.key, candidate.key].join("|"),
+            markup: variant.markup
+          };
+        }
+      }
+    }
+
+    markUnsafe(baseHash);
+    return null;
+  }
+
   function setRowAndSummaryVisibility(row, hidden) {
     updateClassIfNeeded(row, HIDDEN_CLASS, hidden);
     const summary = getExistingRowSummary(row);
@@ -1284,49 +2007,44 @@
 
     removeLegacyInlineBadges(row);
 
+    if (!Number.isFinite(loadData.totalMiles) && Number.isFinite(loadData.tripMiles) && Number.isFinite(loadData.emptyMiles)) {
+      loadData.totalMiles = calculateTotalMiles(loadData.tripMiles, loadData.emptyMiles);
+    }
+
+    if (!Number.isFinite(loadData.allInRpm) && Number.isFinite(loadData.price) && Number.isFinite(loadData.totalMiles)) {
+      loadData.allInRpm = calculateAllInRpm(loadData.price, loadData.totalMiles);
+    }
+
     const shouldShow =
-      Number.isFinite(loadData.totalMiles) ||
-      Number.isFinite(loadData.rpm) ||
-      Number.isFinite(loadData.allInRpm);
+      Number.isFinite(loadData.totalMiles) &&
+      loadData.totalMiles > 0 &&
+      Number.isFinite(loadData.allInRpm) &&
+      loadData.allInRpm > 0;
     const existing = getExistingRowSummary(row);
 
     if (!shouldShow) {
       existing?.remove();
       rowSummaryMap.delete(row);
+      delete row.dataset.datHelperNoSafeBadgeHash;
+      if (row.dataset.datHelperOriginalPosition !== undefined) {
+        row.style.position = row.dataset.datHelperOriginalPosition || "";
+        delete row.dataset.datHelperOriginalPosition;
+      }
       return;
     }
 
-    const nextHash = buildRowSummaryHash(loadData);
-    const nextMarkup = buildRowSummaryMarkup(loadData);
-    const placement = findInlineSummaryPlacementTarget(row);
-    if (!placement?.target) {
-      existing?.remove();
-      rowSummaryMap.delete(row);
+    const rendered = renderTotalRpmHelper(row, loadData);
+    if (!rendered?.node) {
       return;
     }
 
-    let summary = existing;
-    if (!(summary instanceof HTMLElement)) {
-      summary = createHelperNode("span", ROW_SUMMARY_CLASS);
-      summary.dataset.datHelperRole = ROW_SUMMARY_ROLE;
-    }
-
-    if (summary.parentElement !== placement.target) {
-      placement.target.appendChild(summary);
-    }
-
-    updateClassIfNeeded(summary, "dat-helper-floating", placement.floating);
-    if (placement.floating && window.getComputedStyle(row).position === "static") {
-      row.dataset.datHelperOriginalPosition = row.style.position || "";
-      row.style.position = "relative";
-    }
-
-    if (summary.dataset.datHelperValueHash === nextHash && summary.innerHTML === nextMarkup) {
+    const summary = rendered.node;
+    if (summary.dataset.datHelperValueHash === rendered.hash && summary.innerHTML === rendered.markup) {
       return;
     }
 
-    summary.innerHTML = nextMarkup;
-    summary.dataset.datHelperValueHash = nextHash;
+    summary.innerHTML = rendered.markup;
+    summary.dataset.datHelperValueHash = rendered.hash;
     rowSummaryMap.set(row, summary);
   }
 
@@ -1494,6 +2212,8 @@
     if (!currentSettings.enabled) {
       return;
     }
+
+    displayDebugRowsLogged = 0;
 
     const result =
       (await getCandidateLoadElements({ allowFullScan: false })) ||
