@@ -7,8 +7,7 @@ const DEFAULT_SETTINGS = {
   minRpm: null,
   maxRpm: null,
   minTripMiles: null,
-  maxTripMiles: null,
-  strictMode: false
+  maxTripMiles: null
 };
 
 const FIELD_IDS = [
@@ -20,15 +19,24 @@ const FIELD_IDS = [
   "maxTripMiles"
 ];
 
+function normalizeSettings(rawSettings) {
+  return {
+    enabled: Boolean(rawSettings?.enabled),
+    minPrice: rawSettings?.minPrice ?? null,
+    maxPrice: rawSettings?.maxPrice ?? null,
+    minRpm: rawSettings?.minRpm ?? null,
+    maxRpm: rawSettings?.maxRpm ?? null,
+    minTripMiles: rawSettings?.minTripMiles ?? null,
+    maxTripMiles: rawSettings?.maxTripMiles ?? null
+  };
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   const elements = {
     enabled: document.getElementById("enabled"),
     toggleStatus: document.getElementById("toggleStatus"),
-    strictMode: document.getElementById("strictMode"),
     applyButton: document.getElementById("applyButton"),
     clearButton: document.getElementById("clearButton"),
-    debugButton: document.getElementById("debugButton"),
-    copyButton: document.getElementById("copyButton"),
     statusMessage: document.getElementById("statusMessage")
   };
 
@@ -60,7 +68,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   function readForm() {
     return {
       enabled: elements.enabled.checked,
-      strictMode: elements.strictMode.checked,
       minPrice: parseNumericInput(fields.minPrice),
       maxPrice: parseNumericInput(fields.maxPrice),
       minRpm: parseNumericInput(fields.minRpm),
@@ -72,7 +79,6 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   function populateForm(settings) {
     elements.enabled.checked = Boolean(settings.enabled);
-    elements.strictMode.checked = Boolean(settings.strictMode);
     updateToggleLabel(Boolean(settings.enabled));
 
     FIELD_IDS.forEach((id) => {
@@ -90,6 +96,13 @@ document.addEventListener("DOMContentLoaded", async () => {
     return tabs[0] || null;
   }
 
+  function isDatPageUrl(url) {
+    return typeof url === "string" && (
+      url.includes("one.dat.com/search-loads") ||
+      url.startsWith("https://one.dat.com/")
+    );
+  }
+
   async function sendToActiveDatTab(message) {
     const tab = await getActiveDatTab();
     if (!tab?.id) {
@@ -104,13 +117,15 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   async function saveSettings(nextSettings, successMessage) {
-    await STORAGE_AREA.set({ [SETTINGS_KEY]: nextSettings });
-    populateForm(nextSettings);
+    const normalizedSettings = normalizeSettings(nextSettings);
+    await STORAGE_AREA.set({ [SETTINGS_KEY]: normalizedSettings });
+    populateForm(normalizedSettings);
     setStatus(successMessage);
+    return normalizedSettings;
   }
 
   const stored = await STORAGE_AREA.get({ [SETTINGS_KEY]: DEFAULT_SETTINGS });
-  populateForm({ ...DEFAULT_SETTINGS, ...(stored[SETTINGS_KEY] || {}) });
+  populateForm(normalizeSettings(stored[SETTINGS_KEY] || DEFAULT_SETTINGS));
   setStatus("Ready.");
 
   elements.enabled.addEventListener("change", async () => {
@@ -134,11 +149,28 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   elements.applyButton.addEventListener("click", async () => {
     try {
-      const nextSettings = readForm();
-      await saveSettings(nextSettings, "Filters saved.");
-      if (nextSettings.enabled) {
-        await sendToActiveDatTab({ type: "DAT_HELPER_APPLY_NOW" });
+      const nextSettings = {
+        ...readForm(),
+        enabled: true
+      };
+      const savedSettings = await saveSettings(nextSettings, "Filters saved. Refreshing DAT...");
+      const tab = await getActiveDatTab();
+
+      if (!tab?.id || !isDatPageUrl(tab.url)) {
+        setStatus("Filters saved. Open DAT to apply.");
+        return;
       }
+
+      try {
+        await chrome.tabs.sendMessage(tab.id, {
+          type: "DAT_HELPER_SETTINGS_UPDATED",
+          settings: savedSettings
+        });
+      } catch (error) {
+        console.debug("DAT settings update message skipped before reload.", error);
+      }
+
+      await chrome.tabs.reload(tab.id);
     } catch (error) {
       console.error(error);
       setStatus(error.message || "Could not apply filters.", true);
@@ -150,7 +182,6 @@ document.addEventListener("DOMContentLoaded", async () => {
       FIELD_IDS.forEach((id) => {
         fields[id].value = "";
       });
-      elements.strictMode.checked = false;
 
       const existing = readForm();
       const clearedSettings = {
@@ -160,49 +191,30 @@ document.addEventListener("DOMContentLoaded", async () => {
         minRpm: null,
         maxRpm: null,
         minTripMiles: null,
-        maxTripMiles: null,
-        strictMode: false
+        maxTripMiles: null
       };
 
-      await saveSettings(clearedSettings, "Filters cleared.");
-      if (clearedSettings.enabled) {
-        await sendToActiveDatTab({ type: "DAT_HELPER_APPLY_NOW" });
+      const savedSettings = await saveSettings(clearedSettings, "Filters cleared. Refreshing DAT...");
+      const tab = await getActiveDatTab();
+
+      if (!tab?.id || !isDatPageUrl(tab.url)) {
+        setStatus("Filters cleared. Open DAT to apply.");
+        return;
       }
+
+      try {
+        await chrome.tabs.sendMessage(tab.id, {
+          type: "DAT_HELPER_SETTINGS_UPDATED",
+          settings: savedSettings
+        });
+      } catch (error) {
+        console.debug("DAT settings update message skipped before reload.", error);
+      }
+
+      await chrome.tabs.reload(tab.id);
     } catch (error) {
       console.error(error);
       setStatus(error.message || "Could not clear filters.", true);
-    }
-  });
-
-  elements.debugButton.addEventListener("click", async () => {
-    try {
-      const response = await sendToActiveDatTab({ type: "DAT_HELPER_RUN_DEBUG_SCAN" });
-      if (!response?.ok) {
-        throw new Error(response?.error || "Debug scan failed.");
-      }
-
-      setStatus(
-        `Debug scan complete. Strategy: ${response.report.selectedStrategyName}. Candidates: ${response.report.candidateCount}.`
-      );
-    } catch (error) {
-      console.error(error);
-      setStatus(error.message || "Could not run debug scan.", true);
-    }
-  });
-
-  elements.copyButton.addEventListener("click", async () => {
-    try {
-      const response = await sendToActiveDatTab({ type: "DAT_HELPER_GET_DEBUG_REPORT" });
-      if (!response?.ok || !response.reportText) {
-        throw new Error(response?.error || "No debug report available.");
-      }
-
-      await navigator.clipboard.writeText(response.reportText);
-      console.log(response.reportText);
-      setStatus("Debug report copied to clipboard.");
-    } catch (error) {
-      console.error(error);
-      setStatus(error.message || "Could not copy debug report.", true);
     }
   });
 });

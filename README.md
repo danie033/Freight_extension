@@ -54,8 +54,6 @@ The popup fields are:
 - `maxRpm`
 - `minTripMiles`
 - `maxTripMiles`
-- `strictMode`
-
 Trip-mile filters are based on trip miles only.
 
 ## Displayed Calculations

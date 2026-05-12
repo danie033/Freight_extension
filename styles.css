@@ -11,37 +11,48 @@
   display: inline-flex;
   flex-direction: column;
   justify-content: center;
-  align-items: flex-start;
-  gap: 1px;
+  align-items: stretch;
+  width: 64px;
+  min-width: 64px;
+  max-width: 64px;
+  box-sizing: border-box;
   font-size: 11px;
-  line-height: 1.05;
+  line-height: 1.15;
   font-weight: 600;
   color: #111827;
   background: transparent;
   border: none;
-  padding: 0 4px;
+  padding: 0;
   margin: 0;
   white-space: nowrap;
   pointer-events: none;
   z-index: 1;
+  font-variant-numeric: tabular-nums;
 }
 
 .dat-helper-row-summary .dat-helper-label {
   font-weight: 700;
   color: #111827;
+  text-align: left;
 }
 
 .dat-helper-row-summary .dat-helper-value {
   font-weight: 700;
   color: #111827;
+  text-align: left;
+  font-variant-numeric: tabular-nums;
 }
 
 .dat-helper-row-summary .dat-helper-separator {
   display: none;
 }
 
-.dat-helper-row-summary > div {
-  display: block;
+.dat-helper-line {
+  display: grid;
+  grid-template-columns: 12px 1fr;
+  column-gap: 3px;
+  align-items: baseline;
+  width: 100%;
 }
 
 .dat-helper-company-cell {

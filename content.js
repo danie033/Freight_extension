@@ -22,8 +22,7 @@
     minRpm: null,
     maxRpm: null,
     minTripMiles: null,
-    maxTripMiles: null,
-    strictMode: false
+    maxTripMiles: null
   };
 
   const PAGE_ROOT_BLOCKLIST = [
@@ -79,6 +78,10 @@
   let lastStatusText = "";
   let lastEnabledState = null;
   let displayDebugRowsLogged = 0;
+  let milesDebugRowsLogged = 0;
+  let rateDebugRowsLogged = 0;
+  let noRateCheckRowsLogged = 0;
+  let milesValidationLogged = false;
   const MIN_APPLY_INTERVAL_MS = 500;
   const rowStateCache = new WeakMap();
   const rowSummaryMap = new WeakMap();
@@ -113,6 +116,278 @@
     const clone = element.cloneNode(true);
     clone.querySelectorAll(`[${EXTENSION_ATTRIBUTE}="true"]`).forEach((node) => node.remove());
     return getPageText(clone);
+  }
+
+  function getCellText(cell) {
+    return getCleanElementText(cell);
+  }
+
+  function getRowCells(row) {
+    if (!(row instanceof HTMLElement)) {
+      return [];
+    }
+
+    const explicitContainer = row.querySelector(".row-cells");
+    const container =
+      explicitContainer instanceof HTMLElement
+        ? explicitContainer
+        : [...row.children].find(
+            (child) =>
+              child instanceof HTMLElement &&
+              child.children.length >= 3 &&
+              [...child.children].some(
+                (grandchild) =>
+                  grandchild instanceof HTMLElement &&
+                  (grandchild.classList.contains("table-cell") ||
+                    grandchild.getAttribute("role") === "gridcell")
+              )
+          );
+    const source = container instanceof HTMLElement ? container : row;
+
+    return [...source.children].filter(
+      (child) =>
+        child instanceof HTMLElement &&
+        isElementVisible(child) &&
+        (child.classList.contains("table-cell") ||
+          child.getAttribute("role") === "gridcell" ||
+          Boolean(
+            child.querySelector(
+              [
+                TEMPLATE_FIELD_SELECTORS.rateCell,
+                TEMPLATE_FIELD_SELECTORS.tripCell,
+                TEMPLATE_FIELD_SELECTORS.deadheadOriginCell,
+                TEMPLATE_FIELD_SELECTORS.deadheadDestinationCell,
+                TEMPLATE_FIELD_SELECTORS.pickupCell
+              ].join(",")
+            )
+          ))
+    );
+  }
+
+  function findCellBySelector(row, selector) {
+    if (!(row instanceof HTMLElement) || !selector) {
+      return null;
+    }
+
+    const directMatch = row.querySelector(selector);
+    if (directMatch instanceof HTMLElement) {
+      return directMatch;
+    }
+
+    return getRowCells(row).find((cell) => cell.querySelector(selector) instanceof HTMLElement) || null;
+  }
+
+  function findTripCell(row) {
+    const explicitTripCell = findCellBySelector(row, TEMPLATE_FIELD_SELECTORS.tripCell);
+    if (explicitTripCell) {
+      return explicitTripCell;
+    }
+
+    const rowCells = getRowCells(row);
+    const pickupIndex = rowCells.findIndex(
+      (cell) => cell.querySelector(TEMPLATE_FIELD_SELECTORS.pickupCell) instanceof HTMLElement
+    );
+    const routeIndex = rowCells.findIndex((cell) => {
+      const text = getCellText(cell);
+      return (
+        cell.querySelector(TEMPLATE_FIELD_SELECTORS.originCell) instanceof HTMLElement ||
+        cell.querySelector(TEMPLATE_FIELD_SELECTORS.destinationCell) instanceof HTMLElement ||
+        /\btrip\b/i.test(text)
+      );
+    });
+
+    if (routeIndex >= 0) {
+      return rowCells[routeIndex];
+    }
+
+    if (pickupIndex > 0) {
+      return rowCells[pickupIndex - 1] || null;
+    }
+
+    return null;
+  }
+
+  function findHeaderCellByText(label) {
+    const normalizedLabel = String(label || "").trim().toLowerCase();
+    if (!normalizedLabel) {
+      return null;
+    }
+
+    const headerCandidates = [
+      ...document.querySelectorAll(
+        '.header-cell, [role="columnheader"], [data-test$="-column-button"], [data-test$="-column-label"], [data-test*="column-button"], [data-test*="column-label"]'
+      )
+    ].filter((element) => element instanceof HTMLElement && isElementVisible(element));
+
+    return (
+      headerCandidates.find((element) => {
+        const text = getCleanElementText(element).trim().toLowerCase();
+        return text === normalizedLabel || text.startsWith(normalizedLabel);
+      }) || null
+    );
+  }
+
+  function findCellUnderHeader(row, headerLabel) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const header = findHeaderCellByText(headerLabel);
+    if (!(header instanceof HTMLElement)) {
+      return null;
+    }
+
+    const headerRect = header.getBoundingClientRect();
+    const headerCenter = headerRect.left + headerRect.width / 2;
+    const rowCells = getRowCells(row);
+
+    let bestCell = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    rowCells.forEach((cell) => {
+      const rect = cell.getBoundingClientRect();
+      if (!rect.width || !rect.height) {
+        return;
+      }
+
+      const center = rect.left + rect.width / 2;
+      const distance = Math.abs(center - headerCenter);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestCell = cell;
+      }
+    });
+
+    return bestCell;
+  }
+
+  function findRateCell(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+
+    const explicitRateContent = row.querySelector(TEMPLATE_FIELD_SELECTORS.rateCell);
+    if (explicitRateContent instanceof HTMLElement) {
+      const rowCell =
+        getRowCells(row).find(
+          (cell) => cell === explicitRateContent || cell.contains(explicitRateContent)
+        ) || explicitRateContent;
+      return rowCell;
+    }
+
+    return findCellUnderHeader(row, "Rate");
+  }
+
+  function getRateCellText(row) {
+    const rateCell = findRateCell(row);
+    if (!(rateCell instanceof HTMLElement)) {
+      return "";
+    }
+
+    return getCleanElementText(rateCell).trim();
+  }
+
+  function getVisibleRateColumnText(row) {
+    const rateCell = findRateCell(row);
+    if (rateCell) {
+      return getCleanElementText(rateCell);
+    }
+
+    const rateHeader = findHeaderCellByText("Rate");
+    if (!(rateHeader instanceof HTMLElement)) {
+      return "";
+    }
+
+    const headerRect = rateHeader.getBoundingClientRect();
+    const headerCenterX = headerRect.left + headerRect.width / 2;
+
+    const cells = getRowCells(row)
+      .filter((element) => element instanceof Element)
+      .filter((element) => !element.matches(`[${EXTENSION_ATTRIBUTE}="true"]`))
+      .filter((element) => !element.closest(`[${EXTENSION_ATTRIBUTE}="true"]`));
+
+    let bestCell = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+
+    for (const cell of cells) {
+      const rect = cell.getBoundingClientRect();
+      if (!rect || rect.width === 0 || rect.height === 0) {
+        continue;
+      }
+
+      const centerX = rect.left + rect.width / 2;
+      const distance = Math.abs(centerX - headerCenterX);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        bestCell = cell;
+      }
+    }
+
+    return bestCell ? getCleanElementText(bestCell) : "";
+  }
+
+  function hasPostedRateInVisibleRateColumn(row) {
+    const rateText = getVisibleRateColumnText(row);
+
+    if (!rateText) {
+      return false;
+    }
+
+    const cleaned = rateText.replace(/\s+/g, " ").trim();
+    if (!cleaned) {
+      return false;
+    }
+
+    if (/^[\-\u2013\u2014]+$/.test(cleaned)) {
+      return false;
+    }
+
+    return /\$\s*\d{1,3}(?:,\d{3})+(?!\s*[*]?\s*\/\s*mi)|\$\s*\d{3,6}(?!\s*[*]?\s*\/\s*mi)/i.test(
+      cleaned
+    );
+  }
+
+  function findDhOriginCell(row) {
+    const explicitDhOriginCell = findCellBySelector(row, TEMPLATE_FIELD_SELECTORS.deadheadOriginCell);
+    if (explicitDhOriginCell) {
+      return explicitDhOriginCell;
+    }
+
+    const rowCells = getRowCells(row);
+    const tripCell = findTripCell(row);
+    const tripIndex = rowCells.findIndex((cell) => cell === tripCell);
+    const pickupIndex = rowCells.findIndex(
+      (cell) => cell.querySelector(TEMPLATE_FIELD_SELECTORS.pickupCell) instanceof HTMLElement
+    );
+
+    if (tripIndex >= 0 && pickupIndex > tripIndex + 1) {
+      return rowCells[tripIndex + 1] || null;
+    }
+
+    return null;
+  }
+
+  function findDhDropCell(row) {
+    const explicitDhDropCell = findCellBySelector(row, TEMPLATE_FIELD_SELECTORS.deadheadDestinationCell);
+    if (explicitDhDropCell) {
+      return explicitDhDropCell;
+    }
+
+    const rowCells = getRowCells(row);
+    const pickupIndex = rowCells.findIndex(
+      (cell) => cell.querySelector(TEMPLATE_FIELD_SELECTORS.pickupCell) instanceof HTMLElement
+    );
+
+    if (pickupIndex > 0) {
+      const tripCell = findTripCell(row);
+      const originDhCell = findDhOriginCell(row);
+      const candidate = rowCells[pickupIndex - 1];
+      if (candidate && candidate !== tripCell && candidate !== originDhCell) {
+        return candidate;
+      }
+    }
+
+    return null;
   }
 
   function sampleText(text, limit = 220) {
@@ -201,9 +476,20 @@
       minRpm: settings.minRpm,
       maxRpm: settings.maxRpm,
       minTripMiles: settings.minTripMiles,
-      maxTripMiles: settings.maxTripMiles,
-      strictMode: settings.strictMode
+      maxTripMiles: settings.maxTripMiles
     });
+  }
+
+  function normalizeSettings(rawSettings) {
+    return {
+      enabled: Boolean(rawSettings?.enabled),
+      minPrice: rawSettings?.minPrice ?? null,
+      maxPrice: rawSettings?.maxPrice ?? null,
+      minRpm: rawSettings?.minRpm ?? null,
+      maxRpm: rawSettings?.maxRpm ?? null,
+      minTripMiles: rawSettings?.minTripMiles ?? null,
+      maxTripMiles: rawSettings?.maxTripMiles ?? null
+    };
   }
 
   function getCandidateSignature(elements) {
@@ -359,6 +645,35 @@
     return match ? toNumber(match[1]) : null;
   }
 
+  function parsePostedRateFromRateCell(row) {
+    return parsePostedRateFromText(getVisibleRateColumnText(row));
+  }
+
+  function parsePostedRateFromText(text) {
+    if (!text) {
+      return null;
+    }
+
+    const cleaned = String(text).replace(/\s+/g, " ").trim();
+    if (!cleaned || /^[\-\u2013\u2014]+$/.test(cleaned)) {
+      return null;
+    }
+
+    const matches = [
+      ...cleaned.matchAll(/\$\s*(\d{1,3}(?:,\d{3})+|\d{3,6})(?!\s*[*]?\s*\/\s*mi)/gi)
+    ];
+    if (!matches.length) {
+      return null;
+    }
+
+    const parsed = Number(matches[0][1].replace(/,/g, ""));
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function parsePriceFromRateCell(row) {
+    return parsePostedRateFromRateCell(row);
+  }
+
   function parseMilesFromText(text, prioritizedPatterns) {
     if (!text) {
       return null;
@@ -400,21 +715,226 @@
     ]);
   }
 
-  function parseEmptyMiles(text) {
-    return parseMilesFromText(text, [
-      /\(\s*(\d[\d,]*)\s*\)/,
-      /\b(?:dh|deadhead|empty)\b[^\d]{0,24}(\d[\d,]*)\s*(?:mi|miles)\b/i,
-      /\borigin deadhead\b[^\d]{0,24}(\d[\d,]*)\s*(?:mi|miles)\b/i,
-      /\bpickup deadhead\b[^\d]{0,24}(\d[\d,]*)\s*(?:mi|miles)\b/i
-    ]);
-  }
-
-  function calculateTotalMiles(tripMiles, emptyMiles) {
-    if (!Number.isFinite(tripMiles) || !Number.isFinite(emptyMiles)) {
+  function parseDhMilesFromCellText(text) {
+    const normalizedText = String(text || "").trim();
+    if (!normalizedText) {
       return null;
     }
 
-    return tripMiles + emptyMiles;
+    const compactMiles = normalizedText.match(/^\(?\s*(\d[\d,]*)\s*(?:mi|miles)?\s*\)?$/i);
+    if (compactMiles) {
+      return toNumber(compactMiles[1]);
+    }
+
+    return null;
+  }
+
+  function parseOriginEmptyMiles(text, options = {}) {
+    const { allowCompact = false } = options;
+    const normalizedText = String(text || "").trim();
+
+    if (allowCompact) {
+      const compactMiles = parseDhMilesFromCellText(normalizedText);
+      if (compactMiles != null) {
+        return compactMiles;
+      }
+    }
+
+    for (const pattern of [
+      /\bDH-O\b[^\d]{0,12}(\d[\d,]*)\b/i,
+      /\borigin\s+(?:dh|deadhead)\b[^\d]{0,20}(\d[\d,]*)\b/i,
+      /\bpick(?:up)?\s+dh\b[^\d]{0,20}(\d[\d,]*)\b/i,
+      /\bpickup\s+deadhead\b[^\d]{0,20}(\d[\d,]*)\b/i,
+      /\bempty\s+pick\b[^\d]{0,20}(\d[\d,]*)\b/i
+    ]) {
+      const match = normalizedText.match(pattern);
+      if (match) {
+        return toNumber(match[1]);
+      }
+    }
+
+    return null;
+  }
+
+  function parseDropEmptyMiles(text, options = {}) {
+    const { allowCompact = false } = options;
+    const normalizedText = String(text || "").trim();
+
+    if (allowCompact) {
+      const compactMiles = parseDhMilesFromCellText(normalizedText);
+      if (compactMiles != null) {
+        return compactMiles;
+      }
+    }
+
+    for (const pattern of [
+      /\bDH-D\b[^\d]{0,12}(\d[\d,]*)\b/i,
+      /\bdestination\s+(?:dh|deadhead)\b[^\d]{0,20}(\d[\d,]*)\b/i,
+      /\bdelivery\s+(?:dh|deadhead)\b[^\d]{0,20}(\d[\d,]*)\b/i,
+      /\bdrop\s+(?:dh|deadhead|empty)\b[^\d]{0,20}(\d[\d,]*)\b/i
+    ]) {
+      const match = normalizedText.match(pattern);
+      if (match) {
+        return toNumber(match[1]);
+      }
+    }
+
+    return null;
+  }
+
+  function parseEmptyMiles(text) {
+    const originEmptyMiles = parseOriginEmptyMiles(text);
+    return Number.isFinite(originEmptyMiles) ? originEmptyMiles : 0;
+  }
+
+  function calculateTotalMiles(tripMiles, originEmptyMiles, dropEmptyMiles) {
+    if (!Number.isFinite(tripMiles) || tripMiles <= 0) {
+      return null;
+    }
+
+    const origin = Number.isFinite(originEmptyMiles) ? originEmptyMiles : 0;
+    const drop = Number.isFinite(dropEmptyMiles) ? dropEmptyMiles : 0;
+
+    return tripMiles + origin + drop;
+  }
+
+  function logMilesDebugRow(loadData) {
+    if (milesDebugRowsLogged >= 5) {
+      return;
+    }
+
+    milesDebugRowsLogged += 1;
+    console.log("[DAT Helper Miles]", `row ${milesDebugRowsLogged}`, {
+      tripCellText: loadData.tripCellText || "",
+      dhOriginCellText: loadData.dhOriginCellText || "",
+      dhDropCellText: loadData.dhDropCellText || "",
+      parsedTripMiles: loadData.tripMiles,
+      parsedEmptyPickMiles: loadData.emptyPickMiles,
+      parsedDropEmptyMiles: loadData.dropEmptyMiles,
+      totalMiles: loadData.totalMiles
+    });
+
+    if (
+      loadData.emptyPickMiles === 0 &&
+      loadData.dropEmptyMiles === 0 &&
+      Number.isFinite(loadData.tripMiles) &&
+      Number.isFinite(loadData.totalMiles) &&
+      loadData.totalMiles !== loadData.tripMiles
+    ) {
+      console.error("[DAT Helper Miles] ERROR total mismatch when empty miles are zero", {
+        tripMiles: loadData.tripMiles,
+        emptyPickMiles: loadData.emptyPickMiles,
+        dropEmptyMiles: loadData.dropEmptyMiles,
+        totalMiles: loadData.totalMiles,
+        tripCellText: loadData.tripCellText || "",
+        dhOriginCellText: loadData.dhOriginCellText || "",
+        dhDropCellText: loadData.dhDropCellText || ""
+      });
+    }
+  }
+
+  function logRateDebugRow(loadData, filterResult) {
+    if (rateDebugRowsLogged >= 10) {
+      return;
+    }
+
+    rateDebugRowsLogged += 1;
+    console.log("[DAT Helper Rate]", `row ${rateDebugRowsLogged}`, {
+      rateCellText: loadData.rateCellText || "",
+      parsedPrice: loadData.price,
+      tripMiles: loadData.tripMiles,
+      rpm: loadData.rpm,
+      baseEligible: Boolean(filterResult?.baseEligible),
+      hiddenReason: filterResult?.hiddenReason || ""
+    });
+  }
+
+  function logNoRateCheckRow(rowIndex, rateText, hasPostedRate, parsedPrice, action, reason) {
+    if (noRateCheckRowsLogged >= 20) {
+      return;
+    }
+
+    noRateCheckRowsLogged += 1;
+    console.log("[DAT Helper No Rate Check]", {
+      rowIndex,
+      rateText,
+      hasPostedRate,
+      parsedPrice,
+      action,
+      reason
+    });
+  }
+
+  function runMilesParsingValidationOnce() {
+    if (milesValidationLogged) {
+      return;
+    }
+
+    milesValidationLogged = true;
+
+    const cases = [
+      {
+        name: "Case 1",
+        tripMiles: 471,
+        dhOriginCellText: "",
+        dhDropCellText: "",
+        expected: { emptyPickMiles: 0, dropEmptyMiles: 0, totalMiles: 471 }
+      },
+      {
+        name: "Case 2",
+        tripMiles: 471,
+        dhOriginCellText: "(350)",
+        dhDropCellText: "",
+        expected: { emptyPickMiles: 350, dropEmptyMiles: 0, totalMiles: 821 }
+      },
+      {
+        name: "Case 3",
+        tripMiles: 471,
+        dhOriginCellText: "350",
+        dhDropCellText: "150",
+        expected: { emptyPickMiles: 350, dropEmptyMiles: 150, totalMiles: 971 }
+      },
+      {
+        name: "Case 4",
+        tripMiles: 471,
+        dhOriginCellText: "",
+        dhDropCellText: "",
+        rowText: "(205) 617-1288",
+        expected: { emptyPickMiles: 0, dropEmptyMiles: 0, totalMiles: 471 }
+      },
+      {
+        name: "Case 5",
+        tripMiles: 471,
+        dhOriginCellText: "",
+        dhDropCellText: "",
+        rowText: "97 CS 18 DTP",
+        expected: { emptyPickMiles: 0, dropEmptyMiles: 0, totalMiles: 471 }
+      }
+    ];
+
+    const results = cases.map((testCase) => {
+      const emptyPickMiles =
+        parseOriginEmptyMiles(testCase.dhOriginCellText, { allowCompact: true }) ??
+        parseOriginEmptyMiles(testCase.rowText || "") ??
+        0;
+      const dropEmptyMiles =
+        parseDropEmptyMiles(testCase.dhDropCellText, { allowCompact: true }) ??
+        parseDropEmptyMiles(testCase.rowText || "") ??
+        0;
+      const totalMiles = calculateTotalMiles(testCase.tripMiles, emptyPickMiles, dropEmptyMiles);
+
+      return {
+        name: testCase.name,
+        pass:
+          emptyPickMiles === testCase.expected.emptyPickMiles &&
+          dropEmptyMiles === testCase.expected.dropEmptyMiles &&
+          totalMiles === testCase.expected.totalMiles,
+        expected: testCase.expected,
+        actual: { emptyPickMiles, dropEmptyMiles, totalMiles }
+      };
+    });
+
+    log("miles parsing validation", results);
   }
 
   function calculateRpm(price, tripMiles) {
@@ -433,39 +953,64 @@
     return price / totalMiles;
   }
 
+  function calculateTotalRpm(price, totalMiles) {
+    return calculateAllInRpm(price, totalMiles);
+  }
+
   function extractLoadData(element) {
     const rawText = getCleanRowText(element);
-    const rateCell = element.querySelector(TEMPLATE_FIELD_SELECTORS.rateCell);
-    const tripCell = element.querySelector(TEMPLATE_FIELD_SELECTORS.tripCell);
-    const deadheadOriginCell = element.querySelector(TEMPLATE_FIELD_SELECTORS.deadheadOriginCell);
-    const deadheadDestinationCell = element.querySelector(TEMPLATE_FIELD_SELECTORS.deadheadDestinationCell);
+    const rateCell = findRateCell(element);
+    const tripCell = findTripCell(element);
+    const deadheadOriginCell = findDhOriginCell(element);
+    const deadheadDestinationCell = findDhDropCell(element);
     const originCell = element.querySelector(TEMPLATE_FIELD_SELECTORS.originCell);
     const destinationCell = element.querySelector(TEMPLATE_FIELD_SELECTORS.destinationCell);
 
-    const rateText = getPageText(rateCell);
-    const tripText = getPageText(tripCell);
-    const deadheadText = getPageText(deadheadOriginCell) || getPageText(deadheadDestinationCell);
-    const price = parsePrice(rateText || rawText);
-    const tripMiles = parseTripMiles(tripText || rawText);
-    const emptyMiles = parseEmptyMiles(deadheadText || rawText);
-    const totalMiles = calculateTotalMiles(tripMiles, emptyMiles);
+    const rateText = getRateCellText(element);
+    const tripText = getCellText(tripCell);
+    const deadheadOriginText = getCellText(deadheadOriginCell);
+    const deadheadDestinationText = getCellText(deadheadDestinationCell);
+    const price = parsePriceFromRateCell(element);
+    const tripMiles = parseTripMiles(tripText) ?? parseTripMiles(rawText);
+    const originEmptyMilesRaw =
+      parseOriginEmptyMiles(deadheadOriginText, { allowCompact: true }) ??
+      (!deadheadOriginCell ? parseOriginEmptyMiles(rawText) : null);
+    const dropEmptyMilesRaw =
+      parseDropEmptyMiles(deadheadDestinationText, { allowCompact: true }) ??
+      (!deadheadDestinationCell ? parseDropEmptyMiles(rawText) : null);
+    const originEmptyMiles = Number.isFinite(originEmptyMilesRaw) ? originEmptyMilesRaw : 0;
+    const dropEmptyMiles = Number.isFinite(dropEmptyMilesRaw) ? dropEmptyMilesRaw : 0;
+    const emptyMiles = originEmptyMiles;
+    const totalMiles = calculateTotalMiles(tripMiles, originEmptyMiles, dropEmptyMiles);
     const rpm = calculateRpm(price, tripMiles);
-    const allInRpm = calculateAllInRpm(price, totalMiles);
+    const totalRpm = calculateTotalRpm(price, totalMiles);
+    const allInRpm = totalRpm;
     const displayedRpm = parseRatePerMile(rateText);
 
-    return {
+    const loadData = {
       element,
       price,
       tripMiles,
+      emptyPickMiles: originEmptyMiles,
+      originEmptyMiles,
+      dropEmptyMiles,
       emptyMiles,
       totalMiles,
       rpm,
+      totalRpm,
       allInRpm,
       rawText,
+      rateCellText: rateText,
+      tripCellText: tripText,
+      dhOriginCellText: deadheadOriginText,
+      dhDropCellText: deadheadDestinationText,
       displayedRpm,
       origin: getPageText(originCell),
       destination: getPageText(destinationCell)
     };
+
+    logMilesDebugRow(loadData);
+    return loadData;
   }
 
   function hasPriceLikeText(text) {
@@ -923,31 +1468,56 @@
     ].filter((filter) => filter.min != null || filter.max != null);
   }
 
+  function isBaseEligibleLoad(loadData) {
+    return (
+      Number.isFinite(loadData.price) &&
+      loadData.price > 0 &&
+      Number.isFinite(loadData.tripMiles) &&
+      loadData.tripMiles > 0 &&
+      Number.isFinite(loadData.rpm) &&
+      loadData.rpm > 0
+    );
+  }
+
   function evaluateFilters(loadData, settings) {
+    if (!isBaseEligibleLoad(loadData)) {
+      return { visible: false, missingFields: [], hiddenReason: "missing-rate-or-rpm", baseEligible: false };
+    }
+
     const activeFilters = getActiveFilterDefinitions(settings);
-    const missingFields = [];
 
     for (const filter of activeFilters) {
       const value = loadData[filter.key];
-      if (value == null) {
-        missingFields.push(filter.label);
-        continue;
-      }
-
       if (filter.min != null && value < filter.min) {
-        return { visible: false, missingFields };
+        return {
+          visible: false,
+          missingFields: [],
+          hiddenReason:
+            filter.key === "price"
+              ? "failed-price-filter"
+              : filter.key === "rpm"
+                ? "failed-rpm-filter"
+                : "failed-trip-filter",
+          baseEligible: true
+        };
       }
 
       if (filter.max != null && value > filter.max) {
-        return { visible: false, missingFields };
+        return {
+          visible: false,
+          missingFields: [],
+          hiddenReason:
+            filter.key === "price"
+              ? "failed-price-filter"
+              : filter.key === "rpm"
+                ? "failed-rpm-filter"
+                : "failed-trip-filter",
+          baseEligible: true
+        };
       }
     }
 
-    if (missingFields.length && settings.strictMode) {
-      return { visible: false, missingFields };
-    }
-
-    return { visible: true, missingFields };
+    return { visible: true, missingFields: [], hiddenReason: "", baseEligible: true };
   }
 
   function formatMiles(value) {
@@ -1172,6 +1742,11 @@
 
   function addBadgesToLoad(loadData, missingFields) {
     void missingFields;
+    if (loadData?.element instanceof HTMLElement && loadData.element.classList.contains(HIDDEN_CLASS)) {
+      getExistingRowSummary(loadData.element)?.remove();
+      rowSummaryMap.delete(loadData.element);
+      return;
+    }
     renderRowSummaryIdempotently(loadData.element, loadData);
   }
 
@@ -1212,11 +1787,11 @@
   }
 
   function formatDisplayMiles(value) {
-    return Number.isFinite(value) && value > 0 ? Math.round(value).toLocaleString("en-US") : "";
+    return Number.isFinite(value) && value > 0 ? Math.round(value).toLocaleString("en-US") : "N/A";
   }
 
   function formatDisplayRate(value) {
-    return Number.isFinite(value) && value > 0 ? value.toFixed(2) : "";
+    return Number.isFinite(value) && value > 0 ? value.toFixed(2) : "N/A";
   }
 
   function getAvailableInlineSpace(target) {
@@ -1653,14 +2228,11 @@
 
   function buildTwoLineTotalRpmMarkup(loadData) {
     const totalMiles = formatDisplayMiles(loadData.totalMiles);
-    const totalRpm = formatDisplayRate(loadData.allInRpm);
-    if (!totalMiles || !totalRpm) {
-      return "";
-    }
+    const totalRpm = formatDisplayRate(loadData.totalRpm ?? loadData.allInRpm);
 
     return [
-      `<div><span class="dat-helper-label">T</span> <strong class="dat-helper-value">${totalMiles}</strong></div>`,
-      `<div><span class="dat-helper-label">R</span> <strong class="dat-helper-value">${totalRpm}</strong></div>`
+      `<div class="dat-helper-line"><span class="dat-helper-label">T</span><span class="dat-helper-value">${totalMiles}</span></div>`,
+      `<div class="dat-helper-line"><span class="dat-helper-label">R</span><span class="dat-helper-value">${totalRpm}</span></div>`
     ].join("");
   }
 
@@ -1673,9 +2245,14 @@
     console.log("[DAT Helper Display]", `row ${displayDebugRowsLogged}`, {
       price: loadData.price,
       tripMiles: loadData.tripMiles,
-      emptyMiles: loadData.emptyMiles,
+      emptyPickMiles: loadData.emptyPickMiles,
+      originEmptyMiles: loadData.originEmptyMiles,
+      dropEmptyMiles: loadData.dropEmptyMiles,
       totalMiles: loadData.totalMiles,
-      totalRpm: loadData.allInRpm,
+      totalRpm: loadData.totalRpm ?? loadData.allInRpm,
+      tripCellText: loadData.tripCellText || "",
+      dhOriginCellText: loadData.dhOriginCellText || "",
+      dhDropCellText: loadData.dhDropCellText || "",
       renderAttempted: result.renderAttempted,
       placement: result.placement || null,
       skippedReason: result.skippedReason || null
@@ -1704,32 +2281,8 @@
       }
     };
 
-    if (!Number.isFinite(loadData.totalMiles) || loadData.totalMiles <= 0) {
-      logDisplayDebugRow(loadData, {
-        renderAttempted: false,
-        skippedReason: "missing-total-miles"
-      });
-      return null;
-    }
-
-    if (!Number.isFinite(loadData.allInRpm) || loadData.allInRpm <= 0) {
-      logDisplayDebugRow(loadData, {
-        renderAttempted: false,
-        skippedReason: "missing-total-rpm"
-      });
-      return null;
-    }
-
     const formattedMiles = formatDisplayMiles(loadData.totalMiles);
-    const formattedRate = formatDisplayRate(loadData.allInRpm);
-    if (!formattedMiles || !formattedRate) {
-      logDisplayDebugRow(loadData, {
-        renderAttempted: false,
-        skippedReason: "formatting-failed"
-      });
-      return null;
-    }
-
+    const formattedRate = formatDisplayRate(loadData.totalRpm ?? loadData.allInRpm);
     const baseHash = [formattedMiles, formattedRate].join("|");
     const gap = findHelperGap(row);
     let summary = existing;
@@ -1739,14 +2292,6 @@
     }
 
     const markup = buildTwoLineTotalRpmMarkup(loadData);
-    if (!markup) {
-      logDisplayDebugRow(loadData, {
-        renderAttempted: false,
-        skippedReason: "empty-markup"
-      });
-      return null;
-    }
-
     const companyCell = findCompanyCell(row);
     const scoreCell = findScoreCell(row);
     if (!(companyCell instanceof HTMLElement)) {
@@ -1783,6 +2328,8 @@
 
     let placement = "company-cell-right";
     let placementCoordinate = 0;
+    const helperWidth = 64;
+    const helperGap = 8;
 
     if (gap && scoreCell instanceof HTMLElement) {
       const minGapWidth = formattedMiles.length >= 5 || formattedRate.length >= 5 ? 66 : 54;
@@ -1794,10 +2341,12 @@
           row.dataset.datHelperOriginalPosition = row.style.position || "";
           row.style.position = "relative";
         }
-        summary.style.left = `${Math.round(gap.gapLeft - gap.rowRect.left + 8)}px`;
+        const scoreRect = scoreCell.getBoundingClientRect();
+        const left = Math.round(scoreRect.left - gap.rowRect.left - helperWidth - helperGap);
+        summary.style.left = `${left}px`;
         summary.style.right = "auto";
         placement = "gap-between-company-score";
-        placementCoordinate = Math.round(gap.gapLeft - gap.rowRect.left + 8);
+        placementCoordinate = left;
       }
     }
 
@@ -2000,6 +2549,25 @@
     }
   }
 
+  function hideRow(row, reason) {
+    if (!(row instanceof HTMLElement)) {
+      return;
+    }
+
+    row.dataset.datHelperHiddenReason = reason || "";
+    setRowAndSummaryVisibility(row, true);
+    updateClassIfNeeded(row, HIDDEN_CLASS, true);
+  }
+
+  function showRow(row) {
+    if (!(row instanceof HTMLElement)) {
+      return;
+    }
+
+    delete row.dataset.datHelperHiddenReason;
+    setRowAndSummaryVisibility(row, false);
+  }
+
   function renderRowSummaryIdempotently(row, loadData) {
     if (!(row instanceof HTMLElement)) {
       return;
@@ -2007,22 +2575,35 @@
 
     removeLegacyInlineBadges(row);
 
-    if (!Number.isFinite(loadData.totalMiles) && Number.isFinite(loadData.tripMiles) && Number.isFinite(loadData.emptyMiles)) {
-      loadData.totalMiles = calculateTotalMiles(loadData.tripMiles, loadData.emptyMiles);
+    if (!Number.isFinite(loadData.originEmptyMiles)) {
+      loadData.originEmptyMiles = Number.isFinite(loadData.emptyMiles) ? loadData.emptyMiles : 0;
     }
 
-    if (!Number.isFinite(loadData.allInRpm) && Number.isFinite(loadData.price) && Number.isFinite(loadData.totalMiles)) {
-      loadData.allInRpm = calculateAllInRpm(loadData.price, loadData.totalMiles);
+    if (!Number.isFinite(loadData.dropEmptyMiles)) {
+      loadData.dropEmptyMiles = 0;
     }
 
-    const shouldShow =
-      Number.isFinite(loadData.totalMiles) &&
-      loadData.totalMiles > 0 &&
-      Number.isFinite(loadData.allInRpm) &&
-      loadData.allInRpm > 0;
+    loadData.emptyMiles = loadData.originEmptyMiles;
+
+    if (!Number.isFinite(loadData.totalMiles)) {
+      loadData.totalMiles = calculateTotalMiles(
+        loadData.tripMiles,
+        loadData.originEmptyMiles,
+        loadData.dropEmptyMiles
+      );
+    }
+
+    if (!Number.isFinite(loadData.totalRpm)) {
+      loadData.totalRpm = calculateTotalRpm(loadData.price, loadData.totalMiles);
+    }
+
+    if (!Number.isFinite(loadData.allInRpm)) {
+      loadData.allInRpm = loadData.totalRpm;
+    }
+
     const existing = getExistingRowSummary(row);
 
-    if (!shouldShow) {
+    if (!(findCompanyCell(row) instanceof HTMLElement || findScoreCell(row) instanceof HTMLElement)) {
       existing?.remove();
       rowSummaryMap.delete(row);
       delete row.dataset.datHelperNoSafeBadgeHash;
@@ -2057,10 +2638,7 @@
 
     const lines = [
       currentSettings.enabled ? "DAT Helper ON" : "DAT Helper OFF",
-      `Candidates: ${summary.totalCount}`,
-      `Shown: ${summary.visibleCount}`,
-      `Hidden: ${summary.hiddenCount}`,
-      `Missing: ${summary.missingCount}`
+      `Shown: ${summary.visibleCount}`
     ];
 
     if (summary.warning) {
@@ -2118,16 +2696,25 @@
     const sampleLoads = result.elements.slice(0, 3).map((element) => {
       const parsed = extractLoadData(element);
       const analysis = analyzeCandidateElement(element);
+      const filterResult = evaluateFilters(parsed, currentSettings);
       return {
         text: sampleText(parsed.rawText),
         reasons: analysis.reasons,
         parsed: {
           price: parsed.price,
+          parsedPrice: parsed.price,
+          rateCellText: parsed.rateCellText,
           tripMiles: parsed.tripMiles,
-          emptyMiles: parsed.emptyMiles,
-          totalMiles: parsed.totalMiles,
+          emptyPickMiles: parsed.emptyPickMiles,
+          dropEmptyMiles: parsed.dropEmptyMiles,
           rpm: parsed.rpm,
-          allInRpm: parsed.allInRpm
+          totalMiles: parsed.totalMiles,
+          totalRpm: parsed.totalRpm,
+          tripCellText: parsed.tripCellText,
+          dhOriginCellText: parsed.dhOriginCellText,
+          dhDropCellText: parsed.dhDropCellText,
+          baseEligible: filterResult.baseEligible,
+          hiddenReason: filterResult.hiddenReason || ""
         }
       };
     });
@@ -2191,18 +2778,24 @@
     return [
       loadData.price ?? "",
       loadData.tripMiles ?? "",
-      loadData.emptyMiles ?? "",
+      loadData.emptyPickMiles ?? "",
+      loadData.originEmptyMiles ?? "",
+      loadData.dropEmptyMiles ?? "",
       loadData.totalMiles ?? "",
       loadData.rpm?.toFixed(2) ?? "",
+      loadData.totalRpm?.toFixed(2) ?? "",
       loadData.allInRpm?.toFixed(2) ?? ""
     ].join("|");
   }
 
   function buildRenderHash(loadData, missingFields) {
     return [
-      loadData.emptyMiles ?? "",
+      loadData.emptyPickMiles ?? "",
+      loadData.originEmptyMiles ?? "",
+      loadData.dropEmptyMiles ?? "",
       loadData.totalMiles ?? "",
       loadData.rpm?.toFixed(2) ?? "",
+      loadData.totalRpm?.toFixed(2) ?? "",
       loadData.allInRpm?.toFixed(2) ?? "",
       missingFields.join(",")
     ].join("|");
@@ -2214,6 +2807,9 @@
     }
 
     displayDebugRowsLogged = 0;
+    milesDebugRowsLogged = 0;
+    rateDebugRowsLogged = 0;
+    noRateCheckRowsLogged = 0;
 
     const result =
       (await getCandidateLoadElements({ allowFullScan: false })) ||
@@ -2273,7 +2869,7 @@
     isApplyingDomChanges = true;
     try {
       await applyWithObserverPaused(async () => {
-        candidateElements.forEach((element) => {
+        candidateElements.forEach((element, index) => {
           const cleanText = getCleanRowText(element);
           const cleanTextHash = cleanText;
           const cachedState = rowStateCache.get(element);
@@ -2287,6 +2883,70 @@
           let filterResult;
           let parsedDataHash;
           let renderHash;
+          const rowIndex = index + 1;
+          const rateText = getVisibleRateColumnText(element);
+          const parsedPrice = parsePostedRateFromText(rateText);
+          const hasPostedRate = hasPostedRateInVisibleRateColumn(element);
+
+          if (!hasPostedRate) {
+            const hiddenReason = "no-posted-rate";
+            logNoRateCheckRow(rowIndex, rateText, false, parsedPrice, "hide", hiddenReason);
+
+            loadData = {
+              element,
+              price: null,
+              parsedPrice: null,
+              tripMiles: null,
+              emptyPickMiles: 0,
+              originEmptyMiles: 0,
+              dropEmptyMiles: 0,
+              emptyMiles: 0,
+              totalMiles: null,
+              rpm: null,
+              totalRpm: null,
+              allInRpm: null,
+              rawText: cleanText,
+              rateCellText: rateText,
+              tripCellText: "",
+              dhOriginCellText: "",
+              dhDropCellText: "",
+              displayedRpm: null,
+              origin: "",
+              destination: ""
+            };
+            filterResult = {
+              visible: false,
+              missingFields: [],
+              hiddenReason,
+              baseEligible: false
+            };
+            parsedDataHash = buildParsedDataHash(loadData);
+            renderHash = buildRenderHash(loadData, []);
+
+            summary.hiddenCount += 1;
+            hideRow(element, hiddenReason);
+            updateClassIfNeeded(element, MISSING_CLASS, false);
+            getExistingRowSummary(element)?.remove();
+            rowSummaryMap.delete(element);
+            rowStateCache.set(element, {
+              cleanTextHash,
+              parsedDataHash,
+              renderHash,
+              hidden: true,
+              missingData: false,
+              loadData,
+              filterResult,
+              filterHash,
+              candidateSignature
+            });
+
+            if (debugModeActive) {
+              updateClassIfNeeded(element, DEBUG_OUTLINE_CLASS, true);
+            }
+            return;
+          }
+
+          logNoRateCheckRow(rowIndex, rateText, true, parsedPrice, "continue", "");
 
           if (shouldReuse) {
             loadData = cachedState.loadData;
@@ -2300,6 +2960,8 @@
             renderHash = buildRenderHash(loadData, filterResult.visible ? filterResult.missingFields : []);
           }
 
+          logRateDebugRow(loadData, filterResult);
+
           if (filterResult.missingFields.length) {
             summary.missingCount += 1;
           }
@@ -2310,7 +2972,11 @@
             summary.hiddenCount += 1;
           }
 
-          setRowAndSummaryVisibility(element, !filterResult.visible);
+          if (filterResult.visible) {
+            showRow(element);
+          } else {
+            hideRow(element, filterResult.hiddenReason || "");
+          }
           updateClassIfNeeded(
             element,
             MISSING_CLASS,
@@ -2444,7 +3110,7 @@
       [SELECTOR_KEY]: null
     });
 
-    currentSettings = { ...DEFAULT_SETTINGS, ...(stored[SETTINGS_KEY] || {}) };
+    currentSettings = normalizeSettings(stored[SETTINGS_KEY] || DEFAULT_SETTINGS);
     currentSelectorStrategy = stored[SELECTOR_KEY]
       ? {
           ...stored[SELECTOR_KEY],
@@ -2454,6 +3120,7 @@
   }
 
   async function applyCurrentState() {
+    runMilesParsingValidationOnce();
     await loadState();
 
     if (!currentSettings.enabled) {
@@ -2502,7 +3169,7 @@
     }
 
     if (changes[SETTINGS_KEY]) {
-      currentSettings = { ...DEFAULT_SETTINGS, ...changes[SETTINGS_KEY].newValue };
+      currentSettings = normalizeSettings(changes[SETTINGS_KEY].newValue || DEFAULT_SETTINGS);
     }
 
     if (changes[SELECTOR_KEY]) {

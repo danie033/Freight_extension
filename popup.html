@@ -150,18 +150,6 @@
         font: inherit;
       }
 
-      .checkbox-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-top: 14px;
-        font-size: 12px;
-      }
-
-      .checkbox-row input {
-        margin: 0;
-      }
-
       .actions {
         margin-top: 14px;
       }
@@ -264,16 +252,9 @@
           </div>
         </div>
 
-        <label class="checkbox-row" for="strictMode">
-          <input id="strictMode" type="checkbox" />
-          <span>Strict mode hides rows missing required filter values.</span>
-        </label>
-
         <div class="actions">
           <button id="applyButton" class="primary" type="button">Apply Filters</button>
           <button id="clearButton" class="secondary" type="button">Clear Filters</button>
-          <button id="debugButton" class="secondary" type="button">Debug Scan</button>
-          <button id="copyButton" class="secondary" type="button">Copy Debug Report</button>
         </div>
 
         <div id="statusMessage" class="status" aria-live="polite"></div>
