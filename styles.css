@@ -1,0 +1,108 @@
+.dat-helper-hidden {
+  display: none !important;
+}
+
+.dat-helper-missing-data {
+  outline: 2px dashed orange !important;
+  outline-offset: 2px;
+}
+
+.dat-helper-row-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 155px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: clip;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 1px 4px;
+  margin-left: 4px;
+  border-radius: 4px;
+  background: #f8fafc;
+  color: #334155;
+  border: 1px solid #cbd5e1;
+  vertical-align: middle;
+  pointer-events: none;
+}
+
+.dat-helper-row-summary .dat-helper-label {
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.dat-helper-row-summary .dat-helper-value {
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.dat-helper-row-summary .dat-helper-muted {
+  color: #64748b;
+}
+
+.dat-helper-row-summary .dat-helper-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.dat-helper-row-summary .dat-helper-separator {
+  color: #94a3b8;
+}
+
+.dat-helper-row-summary.dat-helper-floating {
+  position: absolute;
+  right: 28px;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 2;
+  max-width: 155px;
+}
+
+.dat-helper-inline-badge {
+  display: none;
+}
+
+.dat-helper-inline-badge[data-badge-type="missing"] {
+  display: inline-flex;
+  padding: 2px 4px;
+  background: #fff4e5;
+  border-color: #f6c27a;
+  color: #7c4a03;
+}
+
+.dat-helper-status {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  background: #111;
+  color: #fff;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font: 12px/1.35 "Segoe UI", Tahoma, sans-serif;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+  max-width: 260px;
+  white-space: normal;
+}
+
+.dat-helper-debug-outline {
+  outline: 2px solid #00aaff !important;
+  outline-offset: 2px;
+}
+
+.dat-helper-debug-panel {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  max-width: 360px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.88);
+  color: #fff;
+  font: 12px/1.4 "Segoe UI", Tahoma, sans-serif;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
+  white-space: pre-line;
+}

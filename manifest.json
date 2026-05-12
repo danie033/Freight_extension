@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "DAT One Load Helper",
+  "version": "2.0.0",
+  "description": "Safe local filtering and calculation helper for visible DAT One load results.",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://one.dat.com/search-loads*",
+    "https://one.dat.com/*"
+  ],
+  "action": {
+    "default_title": "DAT One Load Helper",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://one.dat.com/search-loads*",
+        "https://one.dat.com/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "styles.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
