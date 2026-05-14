@@ -1,3 +1,26 @@
+/*
+ * Pre-hide guard: when the extension is active, hide every candidate load row
+ * by default. A row only becomes visible after it has been marked with
+ * `.dat-helper-passed` by the row pipeline (extract -> eligible -> filter ->
+ * render). Failed rows are switched to `display: none` via `.dat-helper-hidden`,
+ * which overrides the guard, so they never paint to the screen. This is what
+ * prevents the brief unfiltered flicker on scroll / row reuse.
+ */
+html.dat-helper-active
+  [data-test="results-table-body"]
+  .cdk-virtual-scroll-content-wrapper
+  > [id^="table-row-"].row-container:not(.dat-helper-passed) {
+  visibility: hidden !important;
+}
+
+/* Explicit pending marker for rows the observer has just seen but not yet
+   finished evaluating. Doubles as a safety net for any row the page-wide
+   guard above might miss (e.g. layout changes that drop the row container
+   class temporarily). */
+.dat-helper-pending {
+  visibility: hidden !important;
+}
+
 .dat-helper-hidden {
   display: none !important;
 }

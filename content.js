@@ -11,7 +11,24 @@
   const STATUS_CLASS = "dat-helper-status";
   const DEBUG_OUTLINE_CLASS = "dat-helper-debug-outline";
   const DEBUG_PANEL_CLASS = "dat-helper-debug-panel";
-  const HELPER_CLASSES = [HIDDEN_CLASS, MISSING_CLASS, DEBUG_OUTLINE_CLASS];
+  // Pre-hide pipeline classes:
+  //   - PENDING_CLASS  : row has been seen by the observer but has not yet
+  //                      cleared the eligible/filter checks.
+  //   - PASSED_CLASS   : row has been verified to pass every filter and is the
+  //                      only state in which the page-wide CSS guard allows it
+  //                      to paint.
+  //   - ACTIVE_CLASS   : set on <html> while the extension is enabled, which
+  //                      activates the CSS guard rule in styles.css.
+  const PENDING_CLASS = "dat-helper-pending";
+  const PASSED_CLASS = "dat-helper-passed";
+  const ACTIVE_CLASS = "dat-helper-active";
+  const HELPER_CLASSES = [
+    HIDDEN_CLASS,
+    MISSING_CLASS,
+    DEBUG_OUTLINE_CLASS,
+    PENDING_CLASS,
+    PASSED_CLASS
+  ];
   const ROW_SUMMARY_CLASS = "dat-helper-row-summary";
   const ROW_SUMMARY_ROLE = "row-summary";
 
@@ -83,8 +100,17 @@
   let noRateCheckRowsLogged = 0;
   let milesValidationLogged = false;
   const MIN_APPLY_INTERVAL_MS = 500;
-  const rowStateCache = new WeakMap();
+  // `let` (not `const`) so the toggle pipeline can replace it with a fresh
+  // WeakMap on every ON cycle — otherwise a row that was hidden in the
+  // previous run would carry its stale "hidden" decision into the next run
+  // and never get re-evaluated.
+  let rowStateCache = new WeakMap();
   const rowSummaryMap = new WeakMap();
+  // Tracks rows that have already been pushed through the per-row pipeline so
+  // the observer can early-return on duplicate notifications without redoing
+  // any DOM reads. The set is reset when filter settings change (the rows
+  // need to be re-evaluated against the new filters).
+  let processedRows = new WeakSet();
 
   function log(...args) {
     console.log(LOG_PREFIX, ...args);
@@ -1541,6 +1567,14 @@
       updateClassIfNeeded(element, DEBUG_OUTLINE_CLASS, false);
     });
 
+    document.querySelectorAll(`.${PENDING_CLASS}`).forEach((element) => {
+      updateClassIfNeeded(element, PENDING_CLASS, false);
+    });
+
+    document.querySelectorAll(`.${PASSED_CLASS}`).forEach((element) => {
+      updateClassIfNeeded(element, PASSED_CLASS, false);
+    });
+
     document.querySelectorAll(".dat-helper-company-cell").forEach((element) => {
       updateClassIfNeeded(element, "dat-helper-company-cell", false);
     });
@@ -1569,7 +1603,18 @@
           delete row.dataset.datHelperOriginalPosition;
         }
       });
-      removeStatusBadge();
+      // Drop the page-wide CSS guard so DAT renders normally when the
+      // extension is OFF. Also reset every per-row tracker — next enable
+      // must see every row as fresh and re-run the full pipeline against
+      // it, instead of reusing cached "this row was hidden last time"
+      // state from before the toggle.
+      setHelperActive(false);
+      processedRows = new WeakSet();
+      rowStateCache = new WeakMap();
+      // The clearExtensionNodes() call above removed the previous badge along
+      // with every other extension-owned node. Re-render so the user sees
+      // the OFF state instead of a missing badge.
+      renderStatus();
     } finally {
       if (wasObserving && currentSettings.enabled) {
         startObserver();
@@ -2541,6 +2586,188 @@
     return null;
   }
 
+  // -------------------------------------------------------------------------
+  // Pre-hide pipeline helpers
+  //
+  // The core flow is:
+  //   1. The page-wide CSS rule (see styles.css) hides every candidate row by
+  //      default whenever <html> has the `dat-helper-active` class.
+  //   2. The MutationObserver marks newly added rows with the explicit
+  //      `dat-helper-pending` class so even if the page-wide rule misses
+  //      them, they stay invisible.
+  //   3. `processSingleRow` runs extract -> isBaseEligibleLoad -> passesFilters
+  //      -> renderHelper. Only rows that pass every check are tagged with
+  //      `dat-helper-passed`, which is the only state that lets a row paint.
+  //   4. Rows that fail keep `display: none` via `hideRow` so they never
+  //      appear, even for a single frame.
+  // -------------------------------------------------------------------------
+
+  function setHelperActive(active) {
+    const root = document.documentElement;
+    if (!(root instanceof Element)) {
+      return;
+    }
+    if (active) {
+      root.classList.add(ACTIVE_CLASS);
+    } else {
+      root.classList.remove(ACTIVE_CLASS);
+    }
+  }
+
+  function markRowPending(row) {
+    if (!(row instanceof HTMLElement)) {
+      return;
+    }
+    updateClassIfNeeded(row, PASSED_CLASS, false);
+    updateClassIfNeeded(row, PENDING_CLASS, true);
+  }
+
+  function markRowPassed(row) {
+    if (!(row instanceof HTMLElement)) {
+      return;
+    }
+    updateClassIfNeeded(row, PENDING_CLASS, false);
+    updateClassIfNeeded(row, PASSED_CLASS, true);
+  }
+
+  function clearRowPipelineMarks(row) {
+    if (!(row instanceof HTMLElement)) {
+      return;
+    }
+    updateClassIfNeeded(row, PENDING_CLASS, false);
+    updateClassIfNeeded(row, PASSED_CLASS, false);
+  }
+
+  function isCandidateRow(node) {
+    if (!(node instanceof HTMLElement)) {
+      return false;
+    }
+    try {
+      return (
+        node.matches(TEMPLATE_ROW_SELECTOR) &&
+        Boolean(node.closest(TEMPLATE_RESULTS_VIEWPORT_SELECTOR))
+      );
+    } catch (error) {
+      return false;
+    }
+  }
+
+  function extractRowsFromNode(node) {
+    if (!(node instanceof Element)) {
+      return [];
+    }
+
+    const rows = [];
+    if (isCandidateRow(node)) {
+      rows.push(node);
+    }
+
+    try {
+      node.querySelectorAll(TEMPLATE_ROW_SELECTOR).forEach((candidate) => {
+        if (
+          candidate instanceof HTMLElement &&
+          candidate.closest(TEMPLATE_RESULTS_VIEWPORT_SELECTOR)
+        ) {
+          rows.push(candidate);
+        }
+      });
+    } catch (error) {
+      // ignore — selector is hard-coded but `node` may be a detached subtree
+    }
+
+    return rows;
+  }
+
+  function collectInitialCandidateRows() {
+    try {
+      return [...document.querySelectorAll(TEMPLATE_ROW_SELECTOR)].filter(
+        (node) =>
+          node instanceof HTMLElement &&
+          node.closest(TEMPLATE_RESULTS_VIEWPORT_SELECTOR)
+      );
+    } catch (error) {
+      return [];
+    }
+  }
+
+  // Pure per-row pipeline. Returns the filter result for callers that need
+  // bookkeeping (counts, status badge); side effects are limited to:
+  //   - marking the row pending / passed / hidden,
+  //   - rendering the T/R helper for visible rows,
+  //   - cleaning up any helper nodes on rows that turn out to be ineligible.
+  function processSingleRow(row) {
+    if (!(row instanceof HTMLElement)) {
+      return null;
+    }
+    if (!currentSettings.enabled) {
+      return null;
+    }
+
+    // Step 1: hide first — never reveal until proven valid.
+    markRowPending(row);
+
+    // Step 2: no-rate / no-RPM rows are dropped without rendering anything.
+    const rateText = getVisibleRateColumnText(row);
+    const hasPostedRate = hasPostedRateInVisibleRateColumn(row);
+
+    if (!hasPostedRate) {
+      const hiddenReason = "no-posted-rate";
+      hideRow(row, hiddenReason);
+      updateClassIfNeeded(row, MISSING_CLASS, false);
+      getExistingRowSummary(row)?.remove();
+      rowSummaryMap.delete(row);
+      clearRowPipelineMarks(row);
+      processedRows.add(row);
+      return { visible: false, missingFields: [], hiddenReason, baseEligible: false };
+    }
+
+    // Step 3: extract + evaluate. Both functions stay untouched so the actual
+    // filtering, RPM math, and T/R helper behavior are exactly the same.
+    const loadData = extractLoadData(row);
+    const filterResult = evaluateFilters(loadData, currentSettings);
+
+    if (!filterResult.visible) {
+      hideRow(row, filterResult.hiddenReason || "");
+      updateClassIfNeeded(row, MISSING_CLASS, false);
+      clearRowPipelineMarks(row);
+      processedRows.add(row);
+      return filterResult;
+    }
+
+    // Step 4: row passed everything. Reveal and render the T/R helper.
+    showRow(row);
+    updateClassIfNeeded(
+      row,
+      MISSING_CLASS,
+      filterResult.missingFields.length > 0
+    );
+    addBadgesToLoad(loadData, filterResult.missingFields);
+    markRowPassed(row);
+    processedRows.add(row);
+    return filterResult;
+  }
+
+  function processNewRowsFromMutation(node) {
+    if (!currentSettings.enabled) {
+      return;
+    }
+    const rows = extractRowsFromNode(node);
+    if (!rows.length) {
+      return;
+    }
+    // Mark every row pending in one pass before doing any expensive parsing,
+    // so the user never sees a partially evaluated batch.
+    for (const row of rows) {
+      markRowPending(row);
+    }
+    for (const row of rows) {
+      processSingleRow(row);
+    }
+    // Recompute the badge once per batch — querySelectorAll is cheap and
+    // running it once per row would be wasteful.
+    renderStatus();
+  }
+
   function setRowAndSummaryVisibility(row, hidden) {
     updateClassIfNeeded(row, HIDDEN_CLASS, hidden);
     const summary = getExistingRowSummary(row);
@@ -2629,27 +2856,50 @@
     rowSummaryMap.set(row, summary);
   }
 
-  function updateStatusBadge(summary) {
-    let badge = document.querySelector(`.${STATUS_CLASS}[${EXTENSION_ATTRIBUTE}="true"]`);
+  // Count loads the user is actually looking at. We read this from the DOM
+  // (instead of an internal counter) so the number is guaranteed to match
+  // what is visible: a row is "shown" only if our pipeline has neither hidden
+  // it (`dat-helper-hidden` -> display:none) nor left it pre-hidden
+  // (`dat-helper-pending` -> visibility:hidden).
+  function getVisibleLoadCount() {
+    try {
+      const selector =
+        `${TEMPLATE_ROW_SELECTOR}:not(.${HIDDEN_CLASS}):not(.${PENDING_CLASS})`;
+      return document.querySelectorAll(selector).length;
+    } catch (error) {
+      return 0;
+    }
+  }
+
+  // Single source of truth for the status badge.
+  //
+  // Contract:
+  //   - When the extension is ON  -> "DAT Helper ON | Loads: X"
+  //   - When the extension is OFF -> "DAT Helper OFF"
+  //
+  // No debug text, no candidate / hidden / missing counts, no "selector
+  // unsafe" warnings. Anything diagnostic goes to console.warn only.
+  function renderStatus() {
+    const text = currentSettings.enabled
+      ? `DAT Helper ON | Loads: ${getVisibleLoadCount()}`
+      : "DAT Helper OFF";
+
+    let badge = document.querySelector(
+      `.${STATUS_CLASS}[${EXTENSION_ATTRIBUTE}="true"]`
+    );
+
     if (!badge) {
+      if (!document.body) {
+        return;
+      }
       badge = createHelperNode("div", STATUS_CLASS);
       document.body.appendChild(badge);
     }
 
-    const lines = [
-      currentSettings.enabled ? "DAT Helper ON" : "DAT Helper OFF",
-      `Shown: ${summary.visibleCount}`
-    ];
-
-    if (summary.warning) {
-      lines.push(summary.warning);
+    if (badge.textContent !== text) {
+      badge.textContent = text;
     }
-
-    const nextText = lines.join(" | ");
-    if (lastStatusText !== nextText || badge.textContent !== nextText) {
-      badge.textContent = nextText;
-      lastStatusText = nextText;
-    }
+    lastStatusText = text;
   }
 
   function removeStatusBadge() {
@@ -2820,15 +3070,13 @@
       await applyWithObserverPaused(async () => {
         clearExtensionClasses();
         clearExtensionNodes();
-        updateStatusBadge({
-          totalCount: result.elements.length,
-          visibleCount: 0,
-          hiddenCount: 0,
-          missingCount: 0,
-          warning: "DAT Helper: selector unsafe, run Debug Scan"
-        });
+        // Keep the UI clean: just refresh the badge with the standard
+        // "DAT Helper ON | Loads: X" text. The unsafe-selector situation is
+        // a developer concern and stays in the console only — it must never
+        // appear in the user-facing badge.
+        renderStatus();
       });
-      warn("unsafe selector warning", {
+      warn("[DAT Helper] selector unsafe", {
         strategy: result.strategyName,
         diagnostics: safety.diagnostics,
         candidateCount: result.elements.length
@@ -2846,6 +3094,15 @@
       missingCount: 0,
       warning: ""
     };
+
+    // CRITICAL: hide every candidate before doing any per-row work. The
+    // page-wide CSS guard already covers template-row matches, but explicitly
+    // setting `.dat-helper-pending` covers strategy-detected candidates that
+    // don't match the template row selector. No row can paint until the
+    // pipeline below decides it deserves to.
+    for (const element of candidateElements) {
+      markRowPending(element);
+    }
 
     const previousStrategySerialized = JSON.stringify(currentSelectorStrategy || null);
     currentSelectorStrategy = result.strategy
@@ -2928,6 +3185,8 @@
             updateClassIfNeeded(element, MISSING_CLASS, false);
             getExistingRowSummary(element)?.remove();
             rowSummaryMap.delete(element);
+            clearRowPipelineMarks(element);
+            processedRows.add(element);
             rowStateCache.set(element, {
               cleanTextHash,
               parsedDataHash,
@@ -2974,8 +3233,12 @@
 
           if (filterResult.visible) {
             showRow(element);
+            // Reveal the row only after every check passed. This is the
+            // counterpart to the pre-hide step at the top of processLoads.
+            markRowPassed(element);
           } else {
             hideRow(element, filterResult.hiddenReason || "");
+            clearRowPipelineMarks(element);
           }
           updateClassIfNeeded(
             element,
@@ -2986,6 +3249,8 @@
           if (!cachedState || cachedState.renderHash !== renderHash || !shouldReuse) {
             addBadgesToLoad(loadData, filterResult.visible ? filterResult.missingFields : []);
           }
+
+          processedRows.add(element);
 
           if (debugModeActive) {
             updateClassIfNeeded(element, DEBUG_OUTLINE_CLASS, true);
@@ -3004,7 +3269,13 @@
           });
         });
 
-        updateStatusBadge(summary);
+        // Render the badge AFTER all per-row class updates are committed so
+        // the DOM-based count reflects the post-filter state exactly. The
+        // `summary` object is intentionally not passed — the badge derives
+        // its number from the DOM, not from internal counters that could
+        // drift out of sync (e.g. when virtualized rows leave the
+        // candidate set between scans).
+        renderStatus();
         if (debugModeActive && lastDebugReport) {
           renderDebugPanel(lastDebugReport);
         }
@@ -3069,6 +3340,75 @@
     }
   }
 
+  // -------------------------------------------------------------------------
+  // reinitializeFiltering(reason)
+  //
+  // The single source-of-truth path for turning the extension ON, whether
+  // that happens on initial page load or via a toggle. The toggle bug we
+  // were chasing came from two things:
+  //   1. `rowStateCache` and `processedRows` survived across toggles, so a
+  //      row that was hidden in the previous session was reused as "hidden"
+  //      again before the new filters ever ran against it.
+  //   2. We marked rows pending and then waited for the debounced
+  //      `scheduleApply` to run processLoads. The page-wide CSS guard hid
+  //      everything in the meantime — visually identical to "nothing
+  //      matches the filters".
+  //
+  // This function does the work synchronously (well, awaited), without
+  // touching caches from the previous run and without ever using the
+  // debounce.
+  // -------------------------------------------------------------------------
+  async function reinitializeFiltering(reason) {
+    // Step 1 — Wipe every per-row cache. Toggle ON is, by definition,
+    // a fresh filter pass against current DOM. No reuse.
+    processedRows = new WeakSet();
+    rowStateCache = new WeakMap();
+
+    // Step 2 — Force-reset visibility on each candidate row. The page-wide
+    // CSS guard relies on `.dat-helper-passed` to reveal rows; the per-row
+    // pipeline relies on `.dat-helper-hidden` to permanently hide them.
+    // Clear both, plus any leftover inline display style, so the only
+    // thing keeping a row out of view is the pending marker we add next.
+    const rows = collectInitialCandidateRows();
+    for (const row of rows) {
+      row.classList.remove(HIDDEN_CLASS);
+      row.classList.remove(PASSED_CLASS);
+      if (row.style && row.style.display) {
+        row.style.display = "";
+      }
+      delete row.dataset.datHelperHiddenReason;
+      markRowPending(row);
+    }
+
+    // Step 3 — Activate the page-wide CSS guard and the observer BEFORE
+    // running the heavy pass, so any row DAT inserts mid-process is
+    // automatically held in the pending state and picked up by the
+    // observer's per-row pipeline.
+    setHelperActive(true);
+    startObserver();
+
+    // Step 4 — Run the full filter pass immediately (no debounce). When
+    // this resolves, every existing candidate has a final decision:
+    //   - passing rows have `.dat-helper-passed` and the T/R helper,
+    //   - failing rows have `.dat-helper-hidden`.
+    await applyNow(reason);
+
+    // Step 5 — Safety net. If processing somehow ended with zero visible
+    // rows despite candidates in the DOM, run one more pass. This guards
+    // against the worst-case "everything hidden" bug the user reported,
+    // even if its root cause was already addressed by steps 1–4.
+    if (rows.length > 0 && getVisibleLoadCount() === 0) {
+      processedRows = new WeakSet();
+      rowStateCache = new WeakMap();
+      await applyNow(`${reason}-retry`);
+    }
+
+    // Step 6 — Now that every row has a final state, render the badge.
+    // This is the only place the count is computed for the toggle-ON
+    // transition, so it cannot show a stale 0.
+    renderStatus();
+  }
+
   function startObserver() {
     if (observer || !document.body) {
       return;
@@ -3083,7 +3423,58 @@
         return;
       }
 
-      scheduleApply("mutation");
+      // Pre-hide-first strategy:
+      //   For every mutation that adds a node we synchronously mark any
+      //   candidate rows pending and immediately run them through the
+      //   per-row pipeline. There is no debounce and no global rescan, so
+      //   a row goes "appear in DOM -> hidden by CSS guard -> evaluated ->
+      //   either stays hidden (display:none) or becomes visible" in a
+      //   single microtask. This is what removes the unfiltered flash.
+      let sawAddedNodes = false;
+      for (const record of records) {
+        if (!record.addedNodes || !record.addedNodes.length) {
+          continue;
+        }
+        for (const node of record.addedNodes) {
+          if (!(node instanceof Element)) {
+            continue;
+          }
+          sawAddedNodes = true;
+          processNewRowsFromMutation(node);
+        }
+      }
+
+      // Attribute-only mutations (class flips DAT does on its own rows when
+      // recycling virtual scroll slots) can leave a row in a stale state.
+      // ALWAYS re-run the pipeline against the current DOM for any candidate
+      // row whose attributes changed — never skip based on a previous
+      // "processed" flag, because that flag is the very source of the stale
+      // state we want to avoid (see FIX 3 / FIX 8 in the spec). The
+      // per-row pipeline is idempotent, so running it twice on the same
+      // row is safe.
+      let processedAnyAttributeRow = false;
+      if (!sawAddedNodes) {
+        for (const record of records) {
+          if (record.type !== "attributes") {
+            continue;
+          }
+          const target = record.target;
+          if (!(target instanceof HTMLElement)) {
+            continue;
+          }
+          if (!isCandidateRow(target)) {
+            continue;
+          }
+          markRowPending(target);
+          processSingleRow(target);
+          processedAnyAttributeRow = true;
+        }
+      }
+
+      // Refresh the badge if this mutation actually changed the visible set.
+      if (processedAnyAttributeRow) {
+        renderStatus();
+      }
     });
 
     observer.observe(document.body, {
@@ -3129,9 +3520,11 @@
       return;
     }
 
-    startObserver();
     logEnabledStateIfChanged(true);
-    await applyNow("startup");
+    // Route startup through the same path used by toggle-ON. This keeps
+    // both code paths in sync: fresh caches, force-reset visibility,
+    // immediate (non-debounced) processing, retry safety net, then status.
+    await reinitializeFiltering("startup");
   }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -3168,7 +3561,8 @@
       return;
     }
 
-    if (changes[SETTINGS_KEY]) {
+    const settingsChanged = Boolean(changes[SETTINGS_KEY]);
+    if (settingsChanged) {
       currentSettings = normalizeSettings(changes[SETTINGS_KEY].newValue || DEFAULT_SETTINGS);
     }
 
@@ -3188,9 +3582,27 @@
       return;
     }
 
-    startObserver();
     logEnabledStateIfChanged(true);
-    scheduleApply("storage");
+    if (settingsChanged) {
+      // User toggled the extension or edited filters in the popup. Do a
+      // full fresh filter run: reinitializeFiltering wipes the caches,
+      // force-clears stale visibility state, processes immediately (no
+      // debounce), and renders the badge last. This is the fix for the
+      // "toggle ON hides everything" bug — there is no longer a window in
+      // which the page-wide CSS guard is on but processLoads hasn't run.
+      reinitializeFiltering("toggle-on").catch((error) =>
+        warn("reinit failed", error)
+      );
+    } else {
+      // Selector-strategy-only update (saved by our own processLoads after
+      // discovering a new layout). Refreshing through reinitializeFiltering
+      // here would loop: reinit -> processLoads -> save strategy ->
+      // storage event -> reinit. Just keep the observer alive and let the
+      // normal debounced apply pick it up.
+      setHelperActive(true);
+      startObserver();
+      scheduleApply("storage");
+    }
   });
 
   if (document.readyState === "loading") {
