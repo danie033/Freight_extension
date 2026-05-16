@@ -112,6 +112,15 @@
   // need to be re-evaluated against the new filters).
   let processedRows = new WeakSet();
 
+  // Share Load Card lifecycle hooks. The real implementations are wired up
+  // in the SHARE LOAD CARD section near the bottom of the IIFE; reinit and
+  // cleanup invoke whatever is bound here at call time, so forward
+  // references work without monkey-patching.
+  const shareLoad = {
+    start: function () {},
+    stop: function () {}
+  };
+
   function log(...args) {
     console.log(LOG_PREFIX, ...args);
   }
@@ -1590,6 +1599,10 @@
     window.clearTimeout(debounceTimer);
     debounceTimer = null;
     debugModeActive = false;
+    // Stop the Share Load observer so it can't re-inject Share Load
+    // buttons after the user turns the extension off. The buttons
+    // themselves are removed by clearExtensionNodes() below.
+    shareLoad.stop();
     const wasObserving = observerActive;
     if (wasObserving) {
       stopObserver();
@@ -3407,6 +3420,10 @@
     // This is the only place the count is computed for the toggle-ON
     // transition, so it cannot show a stale 0.
     renderStatus();
+
+    // Step 7 — Activate the Share Load feature. Starts its own (separate)
+    // observer + injects buttons into any already-expanded load panel.
+    shareLoad.start();
   }
 
   function startObserver() {
@@ -3612,4 +3629,1439 @@
   } else {
     applyCurrentState().catch((error) => warn("startup failed", error));
   }
+
+
+  // =========================================================================
+  // SHARE LOAD CARD FEATURE
+  // =========================================================================
+
+  var SHARE_BTN_CLASS   = "dat-helper-share-load-btn";
+  var SHARE_TOAST_CLASS = "dat-helper-share-toast";
+  var SHARE_BTN_ROLE    = "share-load-btn";
+  var SHARE_LOG         = "[DAT Helper Share]";
+
+  // ------------------------------------------------------------------
+  // DETECTION
+  // Use TreeWalker to find actual text nodes containing "VIEW ROUTE".
+  // This works regardless of element type, class names, or React version.
+  // ------------------------------------------------------------------
+  // Normalised text of an element, ignoring children we own (so a
+  // button we've already wrapped doesn't appear to have "Share Load"
+  // text bleeding in).
+  function normalizedOwnText(el) {
+    if (!(el instanceof HTMLElement)) return "";
+    // Use a clone so we can strip our own injected nodes without
+    // touching the live DOM.
+    var clone = el.cloneNode(true);
+    var ours = clone.querySelectorAll("[" + EXTENSION_ATTRIBUTE + "='true']");
+    for (var i = 0; i < ours.length; i++) {
+      ours[i].parentNode && ours[i].parentNode.removeChild(ours[i]);
+    }
+    return (clone.innerText || clone.textContent || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function findAllViewRouteElements() {
+    var seen = [];
+    var add = function(el) {
+      if (!(el instanceof HTMLElement)) return;
+      if (el === document.body) return;
+      if (!el.parentElement) return;
+      if (el.getAttribute(EXTENSION_ATTRIBUTE) === "true") return;
+      // If the element is already inside one of our action stacks,
+      // skip — we'd just re-wrap it and end up with nested stacks.
+      if (el.closest && el.closest("." + ACTION_STACK_CLASS)) return;
+      if (seen.indexOf(el) !== -1) return;
+      seen.push(el);
+    };
+
+    // -------- PRIMARY: explicit interactive ancestors with the right text
+    // Look at every button / link / role=button / role=link in the page
+    // and keep the ones whose visible text is essentially just "VIEW
+    // ROUTE" (allowing for an icon character before/after). This is by
+    // far the most reliable detector and avoids the cursor:pointer
+    // inheritance pitfall (cursor is an inherited CSS property, so
+    // walking up the tree and stopping on cursor === "pointer" matches
+    // inner label spans too).
+    var BUTTON_LIKE = 'button, a, [role="button"], [role="link"]';
+    var candidates = document.querySelectorAll(BUTTON_LIKE);
+    for (var i = 0; i < candidates.length; i++) {
+      var el = candidates[i];
+      var t = normalizedOwnText(el);
+      // Allow short prefixes / suffixes around the label (icon glyphs,
+      // chevrons, etc.) but reject anything with substantial extra text.
+      if (/^[\W_]{0,4}view\s*route[\W_]{0,4}$/i.test(t)) {
+        add(el);
+      }
+    }
+
+    // -------- FALLBACK: TreeWalker for cases where DAT renders the pill
+    // as a non-button element (e.g. a clickable <div> without role).
+    // We pick the LARGEST ancestor whose own text is still essentially
+    // just "VIEW ROUTE" (≤ 40 chars). Using "largest" rather than
+    // "first" prevents wrapping an inner label span and accidentally
+    // injecting the share button INSIDE the pill.
+    if (seen.length === 0) {
+      var walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null, false
+      );
+      var node;
+      while ((node = walker.nextNode())) {
+        if (!/VIEW\s*ROUTE/i.test(node.nodeValue)) continue;
+        var fb = node.parentElement;
+        var lastSmall = null;
+        var depth = 0;
+        while (fb && fb !== document.body && depth < 8) {
+          if (fb.getAttribute(EXTENSION_ATTRIBUTE) === "true") break;
+          var ft = normalizedOwnText(fb);
+          if (ft.length === 0 || ft.length > 40) break;
+          lastSmall = fb;
+          fb = fb.parentElement;
+          depth++;
+        }
+        if (lastSmall) add(lastSmall);
+      }
+    }
+
+    return seen;
+  }
+
+  // Walk UP from a VIEW ROUTE element to find the expanded panel container
+  // (the div that holds all load details: rate, equipment, broker, comments)
+  function findExpandedPanel(vrEl) {
+    var SIGNALS = ["COMMENTS", "MARKET RATES", "LOAD RESOURCES", "CONTACT INFORMATION", "EQUIPMENT"];
+    var el = vrEl ? vrEl.parentElement : null;
+    while (el && el !== document.body) {
+      var text = (el.innerText || el.textContent || "").toUpperCase();
+      var hasSignal = false;
+      for (var s = 0; s < SIGNALS.length; s++) {
+        if (text.indexOf(SIGNALS[s]) !== -1) { hasSignal = true; break; }
+      }
+      if (hasSignal) {
+        var rect = el.getBoundingClientRect();
+        if (rect.width > 300 && rect.height > 80) return el;
+      }
+      el = el.parentElement;
+    }
+    // Fallback: return a wide ancestor
+    el = vrEl ? vrEl.parentElement : null;
+    while (el && el !== document.body) {
+      var rect = el.getBoundingClientRect();
+      if (rect.width > 400 && rect.height > 100) return el;
+      el = el.parentElement;
+    }
+    return document.body;
+  }
+
+  // ------------------------------------------------------------------
+  // ACTION STACK
+  //
+  // DAT lays out the VIEW ROUTE button in a horizontal row that also
+  // contains the trip timeline / pickup text. Dropping the Share Load
+  // button as a sibling in that row visually overlaps everything to its
+  // left. To avoid any positioning hacks (no absolute / translate /
+  // negative margins), we wrap the VIEW ROUTE button in a vertical
+  // flex column. The wrapper takes the slot DAT originally allocated to
+  // the button, and the Share Load button gets appended below it in
+  // normal flow.
+  //
+  // The stack is NOT tagged with data-dat-helper="true" — we don't want
+  // clearExtensionNodes() to delete it, because that would also remove
+  // DAT's own VIEW ROUTE button. Instead we use a custom role attribute
+  // and a dedicated unwrap step in stopShareLoadFeature().
+  // ------------------------------------------------------------------
+  var ACTION_STACK_CLASS = "dat-helper-action-stack";
+  var ACTION_STACK_ROLE  = "action-stack";
+
+  function ensureActionStack(vrEl) {
+    if (!(vrEl instanceof HTMLElement) || !vrEl.parentElement) {
+      return null;
+    }
+    var parent = vrEl.parentElement;
+    // Already wrapped? Reuse the existing stack so we never end up with
+    // two columns around the same VIEW ROUTE button.
+    if (parent.classList && parent.classList.contains(ACTION_STACK_CLASS)) {
+      return parent;
+    }
+    var stack = document.createElement("div");
+    stack.className = ACTION_STACK_CLASS;
+    stack.setAttribute("data-dat-helper-role", ACTION_STACK_ROLE);
+    // Insert the stack in vrEl's place, then move vrEl into it. DAT's
+    // button stays untouched — we just re-parent it.
+    parent.insertBefore(stack, vrEl);
+    stack.appendChild(vrEl);
+    return stack;
+  }
+
+  function unwrapActionStacks() {
+    var stacks = document.querySelectorAll("." + ACTION_STACK_CLASS);
+    for (var i = 0; i < stacks.length; i++) {
+      var stack = stacks[i];
+      var parent = stack.parentElement;
+      if (!parent) {
+        continue;
+      }
+      // Move non-helper children (i.e. DAT's VIEW ROUTE button) back to
+      // the original parent, in their original order, right where the
+      // stack sits. Any helper-owned children (the Share Load button)
+      // are dropped — clearExtensionNodes() would have removed them
+      // anyway.
+      while (stack.firstChild) {
+        var child = stack.firstChild;
+        if (child instanceof Element &&
+            child.getAttribute(EXTENSION_ATTRIBUTE) === "true") {
+          child.parentNode.removeChild(child);
+        } else {
+          parent.insertBefore(child, stack);
+        }
+      }
+      parent.removeChild(stack);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // INJECTION
+  // ------------------------------------------------------------------
+  function injectShareButtons() {
+    // Share Load is part of the helper UI — when the extension is OFF the
+    // user expects everything we own to be gone. Bail before doing any
+    // scanning so the share observer can't keep re-injecting buttons after
+    // toggle OFF.
+    if (!currentSettings.enabled) {
+      return;
+    }
+    if (!document.body) {
+      return;
+    }
+
+    var vrEls = findAllViewRouteElements();
+
+    for (var i = 0; i < vrEls.length; i++) {
+      var vrEl = vrEls[i];
+
+      // Wrap VIEW ROUTE in our vertical action stack (idempotent — reuses
+      // the existing stack if vrEl is already inside one). This is what
+      // moves the Share Load button BELOW VIEW ROUTE instead of next to
+      // it, so it no longer overlaps the trip timeline / pickup text.
+      var stack = ensureActionStack(vrEl);
+      if (!stack) {
+        continue;
+      }
+
+      // Idempotency: already have a share button in this stack?
+      if (stack.querySelector('[data-dat-helper-role="' + SHARE_BTN_ROLE + '"]')) {
+        continue;
+      }
+
+      // Find the expanded panel for data extraction
+      var panel = findExpandedPanel(vrEl);
+
+      // Create the button
+      var btn = document.createElement("button");
+      btn.type      = "button";
+      btn.className = SHARE_BTN_CLASS;
+      btn.setAttribute(EXTENSION_ATTRIBUTE, "true");
+      btn.setAttribute("data-dat-helper-role", SHARE_BTN_ROLE);
+      btn.title = "Copy a clean load card to clipboard — paste into WhatsApp, iMessage, email, Slack, etc.";
+      // Two-span layout matches the spec's "📋 Share Load" pattern: the
+      // emoji is decorative-only (aria-hidden) and the label is the
+      // accessible text screen readers and DAT's UI both see.
+      btn.innerHTML =
+        '<span aria-hidden="true" style="font-size:14px;line-height:1">\u{1F4CB}</span>' +
+        '<span>Share Load</span>';
+
+      // Closure to capture panel + btn correctly
+      (function(capturedPanel, capturedBtn) {
+        capturedBtn.addEventListener("click", function(e) {
+          e.stopPropagation();
+          e.preventDefault();
+          var data = extractExpandedLoadDetails(capturedPanel);
+          generateAndCopyLoadCard(data, capturedBtn).catch(function(err) {
+            warn(SHARE_LOG, "click error:", err);
+          });
+        });
+      })(panel, btn);
+
+      // Place the Share Load button BELOW the VIEW ROUTE button. The
+      // stack's column layout + gap takes care of spacing; no margins
+      // or absolute positioning on the button itself.
+      stack.appendChild(btn);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // DATA EXTRACTION — direct DOM selectors on the real DAT panel
+  //
+  // The previous extractor parsed innerText with regex and heuristic
+  // heading walks. That failed because DAT renders Equipment and Rate
+  // as TWO PARALLEL COLUMNS (all labels in one .equipment-label flex
+  // child, all values in a sibling .equipment-data child), which when
+  // serialised via innerText puts every label first, then every value.
+  // "Next non-empty line after 'Load'" is "Truck" — another label —
+  // never "Full". The same trap exists for the Rate column.
+  //
+  // We now read DAT's actual elements directly:
+  //   * <dat-details-header> .trip-place / .trip-miles       — header
+  //   * <dat-route>          .details-header .label "Trip"   — trip
+  //                          .route-origin .date / .city
+  //                          [data-test=load-dho-cell] etc.
+  //   * <dat-equipment>      .equipment-label .data-label    — pair
+  //                          .equipment-data  .data-item     —   by
+  //                                                           index
+  //   * <dat-rate>           .rate-detail-label / .rate-data — pair
+  //                                                           by index
+  //   * <dat-company>        [data-test=company-details-container]
+  //                          .company-details / a[href^=tel:] / MC#text
+  //   * <dat-contacts>       .contacts__phone / .contacts__email
+  //   * <dat-notes>          [data-test=comments-container]
+  //                          .notes-contents
+  //
+  // After DOM lookups, any field still null falls through to the
+  // original text-pattern fallbacks so we don't regress on layouts
+  // we haven't seen yet. Derived totalMiles / totalRpm are still
+  // computed from the numeric values we resolved.
+  // ------------------------------------------------------------------
+  function extractExpandedLoadDetails(panel) {
+    var qt = function(s) { return (s || "").replace(/\s+/g, " ").trim(); };
+    var txt = function(el) { return el ? qt(el.textContent || "") : null; };
+    if (!(panel instanceof HTMLElement)) panel = document.body;
+
+    // ===== Locate the full expanded body =====
+    // findExpandedPanel walks UP from the VIEW ROUTE button looking for
+    // section signals (EQUIPMENT, COMMENTS, CONTACT INFORMATION). Those
+    // all live in the LEFT details-column, so the panel it returns is
+    // typically just the left column — and the right-column
+    // <dat-company> for the broker is NOT a descendant of that. We
+    // need a wider scope. Walk UP from `panel` to find the full
+    // <dat-load-details> (or .table-row-detail) container, which holds
+    // all three columns (left / center / right) of the expanded body.
+    var loadRoot =
+      (panel.closest && (panel.closest("dat-load-details")
+                      || panel.closest(".table-row-detail")))
+      || panel.querySelector("dat-load-details")
+      || panel;
+
+    // ===== Authoritative row parser data =====
+    // The extension already has a working row parser (extractLoadData)
+    // that powers filtering, the T/R helper, and eligibility checks.
+    // Reuse its numeric output for price / miles / RPM so the share
+    // card matches exactly what the dispatcher sees on the row badge
+    // — no re-parsing the expanded panel for values that already
+    // exist. The collapsed row + expanded detail are siblings inside
+    // the same <div class="row-container">, so the panel's row-
+    // container ancestor IS the row the panel belongs to.
+    var rowEl = null;
+    var rowData = null;
+    try {
+      rowEl = panel.closest('.row-container')
+           || panel.closest('[id^="table-row-"]');
+      if (!rowEl && panel.parentElement) {
+        rowEl = panel.parentElement.closest('.row-container')
+             || panel.parentElement.closest('[id^="table-row-"]');
+      }
+      if (rowEl && typeof extractLoadData === "function") {
+        rowData = extractLoadData(rowEl);
+      }
+    } catch (rowErr) {
+      rowData = null;
+    }
+    // Use rowEl as an even wider fallback scope if we still couldn't
+    // find dat-load-details (e.g. DAT changed wrapper classes).
+    if (loadRoot === panel && rowEl) {
+      var betterRoot = rowEl.querySelector("dat-load-details")
+                    || rowEl.querySelector(".table-row-detail");
+      if (betterRoot) loadRoot = betterRoot;
+    }
+
+    // ===== HEADER: origin / destination / trip miles =====
+    var origin = null, destination = null;
+    var hdrTripMiles = null;
+    var detailsHeader = loadRoot.querySelector("dat-details-header");
+    if (detailsHeader) {
+      var tripPlace = detailsHeader.querySelector(".trip-place");
+      if (tripPlace) {
+        // .trip-place contains: <div>City, ST</div> <mat-icon arrow/> <div>City, ST</div>
+        var placeDivs = [];
+        for (var pi = 0; pi < tripPlace.children.length; pi++) {
+          var ch = tripPlace.children[pi];
+          if (ch.tagName && ch.tagName.toLowerCase() === "div") {
+            var t = txt(ch);
+            if (t) placeDivs.push(t);
+          }
+        }
+        if (placeDivs.length >= 1) origin = placeDivs[0];
+        if (placeDivs.length >= 2) destination = placeDivs[placeDivs.length - 1];
+      }
+      var tripMiEl = detailsHeader.querySelector(".trip-miles");
+      if (tripMiEl) hdrTripMiles = txt(tripMiEl);
+    }
+
+    // ===== TRIP SECTION: pickup date, empty miles =====
+    var pickupDate = null;
+    var dhOriginRaw = null, dhDropRaw = null;
+    var routeSection = null;
+    var routeNodes = loadRoot.querySelectorAll("dat-route");
+    for (var rsi = 0; rsi < routeNodes.length; rsi++) {
+      var lbl = routeNodes[rsi].querySelector(".details-header .label");
+      if (lbl && /^Trip$/i.test(qt(lbl.textContent))) {
+        routeSection = routeNodes[rsi];
+        break;
+      }
+    }
+    if (routeSection) {
+      // Pickup date: <div class="date">May 15 - May 16</div>
+      var dateEl = routeSection.querySelector(".route-origin .date")
+                || routeSection.querySelector(".date");
+      if (dateEl) {
+        var dateText = txt(dateEl);
+        var dm = dateText.match(/((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:,?\s+(?:19|20)\d{2})?)/i)
+              || dateText.match(/(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)/);
+        pickupDate = dm ? dm[1] : dateText;
+      }
+      // Empty miles: city text often "Buford, GA (108)"
+      var cityEls = routeSection.querySelectorAll(".city");
+      if (cityEls.length >= 1) {
+        var om = txt(cityEls[0]).match(/\((\d+)\)/);
+        if (om) dhOriginRaw = om[1];
+      }
+      if (cityEls.length >= 2) {
+        var dmCity = txt(cityEls[cityEls.length - 1]).match(/\((\d+)\)/);
+        if (dmCity) dhDropRaw = dmCity[1];
+      }
+    }
+    // Backup: row-cell deadhead elements (always present for visible row).
+    if (dhOriginRaw == null) {
+      var dhoEl = panel.querySelector('[data-test="load-dho-cell"]')
+               || panel.querySelector('.dho .deadhead');
+      if (dhoEl) {
+        var dhom = txt(dhoEl).match(/(\d+)/);
+        if (dhom) dhOriginRaw = dhom[1];
+      }
+    }
+    if (dhDropRaw == null) {
+      var dhdEl = panel.querySelector('[data-test="load-dhd-cell"]')
+               || panel.querySelector('.dhd .deadhead');
+      if (dhdEl) {
+        var dhdT = txt(dhdEl);
+        if (dhdT) {
+          var dhdm = dhdT.match(/(\d+)/);
+          if (dhdm) dhDropRaw = dhdm[1];
+        }
+      }
+    }
+
+    // ===== EQUIPMENT: parallel columns paired by index =====
+    var loadType = null, truck = null, length = null, weight = null;
+    var commodity = null, referenceId = null;
+    var eqMap = {};
+    var eqSection = null;
+    var eqNodes = loadRoot.querySelectorAll("dat-equipment");
+    for (var eqi = 0; eqi < eqNodes.length; eqi++) {
+      // The expanded version has both .equipment-label AND .equipment-data
+      // — the collapsed row-cell version does not.
+      if (eqNodes[eqi].querySelector(".equipment-label") &&
+          eqNodes[eqi].querySelector(".equipment-data")) {
+        eqSection = eqNodes[eqi];
+        break;
+      }
+    }
+    if (eqSection) {
+      var eqLabels = eqSection.querySelectorAll(".equipment-label .data-label");
+      var eqValues = eqSection.querySelectorAll(".equipment-data .data-item");
+      var en = Math.min(eqLabels.length, eqValues.length);
+      for (var eqj = 0; eqj < en; eqj++) {
+        var eLab = txt(eqLabels[eqj]);
+        var eVal = txt(eqValues[eqj]);
+        if (eLab) eqMap[eLab.toLowerCase()] = eVal;
+      }
+      loadType    = eqMap["load"];
+      truck       = eqMap["truck"];
+      length      = eqMap["length"];
+      weight      = eqMap["weight"];
+      commodity   = eqMap["commodity"];
+      referenceId = eqMap["reference id"] || eqMap["reference"];
+    }
+
+    // ===== RATE: Total / Trip / Rate per mile (parallel columns) =====
+    var rate = null, tripMiles = null, ratePerMile = null;
+    var rateSection = null;
+    var rateNodes = loadRoot.querySelectorAll("dat-rate");
+    for (var rti = 0; rti < rateNodes.length; rti++) {
+      // Expanded dat-rate has .rate-details-container; row-cell doesn't.
+      if (rateNodes[rti].querySelector(".rate-details-container") ||
+          rateNodes[rti].querySelector('[data-test="rate-details-container"]')) {
+        rateSection = rateNodes[rti];
+        break;
+      }
+    }
+    if (rateSection) {
+      var rLabelsCol = rateSection.querySelector(".rate-detail-label");
+      var rValuesCol = rateSection.querySelector(".rate-data");
+      if (rLabelsCol && rValuesCol) {
+        var rLabelEls = rLabelsCol.querySelectorAll(".data-label");
+        // Direct children of .rate-data (each wraps one value).
+        var rValueChildren = [];
+        for (var rci = 0; rci < rValuesCol.children.length; rci++) {
+          rValueChildren.push(rValuesCol.children[rci]);
+        }
+        var rn = Math.min(rLabelEls.length, rValueChildren.length);
+        for (var rk = 0; rk < rn; rk++) {
+          var rLab = txt(rLabelEls[rk]);
+          var rValEl = rValueChildren[rk];
+          // For .data-item-ratemiles, prefer the first inner div (the
+          // text node "$4.02") — skips the trailing info mat-icon.
+          if (rValEl.classList && rValEl.classList.contains("data-item-ratemiles")) {
+            var firstInner = rValEl.querySelector("div");
+            if (firstInner) rValEl = firstInner;
+          }
+          var rVal = txt(rValEl);
+          if (!rLab || !rVal) continue;
+          if (/^total$/i.test(rLab)) {
+            var rateMm = rVal.match(/\$?([\d,]+(?:\.\d+)?)/);
+            if (rateMm) rate = "$" + rateMm[1];
+          } else if (/^trip$/i.test(rLab)) {
+            var tripMm = rVal.match(/([\d,]+)/);
+            if (tripMm) tripMiles = tripMm[1].replace(/,/g, "") + " mi";
+          } else if (/rate\s*\/\s*mile/i.test(rLab) || /per\s*mile/i.test(rLab)) {
+            var rpmMm = rVal.match(/\$?([\d.]+)/);
+            if (rpmMm) ratePerMile = "$" + rpmMm[1] + "/mi";
+          }
+        }
+      }
+    }
+
+    // ===== COMPANY: broker name, MC#, phone, email =====
+    // The expanded Company section lives on the RIGHT side of the
+    // load body. To make sure we never accidentally read the LEFT
+    // Contact Information section as a broker source, we search
+    // explicitly for <dat-company> with [data-test="company-details-container"]
+    // (only the expanded version has that attribute — the row-cell
+    // <dat-company> uses .info-container instead). We try loadRoot
+    // first, then fall back to the whole row element, so we still
+    // resolve the company even when findExpandedPanel returned just
+    // the left column.
+    var company = null, mc = null, phone = null, email = null;
+    var companySection =
+         loadRoot.querySelector('dat-company [data-test="company-details-container"]')
+      || loadRoot.querySelector('[data-test="company-details-container"]')
+      || loadRoot.querySelector('dat-company .company-data-container');
+    if (!companySection && rowEl) {
+      companySection =
+           rowEl.querySelector('dat-company [data-test="company-details-container"]')
+        || rowEl.querySelector('[data-test="company-details-container"]')
+        || rowEl.querySelector('dat-company .company-data-container');
+    }
+    // As a last resort, walk all dat-company elements and pick the one
+    // whose own text contains the heading "Company" — this is the
+    // expanded one regardless of attribute changes.
+    if (!companySection) {
+      var allCompanies = (rowEl || loadRoot).querySelectorAll
+                       ? (rowEl || loadRoot).querySelectorAll("dat-company")
+                       : [];
+      for (var dci = 0; dci < allCompanies.length; dci++) {
+        var dc = allCompanies[dci];
+        var dcLabel = dc.querySelector(".details-header .label, .label");
+        if (dcLabel && /^company$/i.test(qt(dcLabel.textContent))) {
+          companySection = dc.querySelector(".details-container")
+                        || dc.querySelector(".data-container")
+                        || dc;
+          break;
+        }
+      }
+    }
+    if (companySection) {
+      // ---- Broker name ----
+      // DAT renders it inside .company-details (textContent decodes &amp;).
+      // Some variants put the name in .company-name directly without a
+      // child .company-details, so try a few selectors in order.
+      var nameEl = companySection.querySelector(".company-name .company-details")
+                || companySection.querySelector(".company-details")
+                || companySection.querySelector(".company-header .company-name")
+                || companySection.querySelector(".company-name");
+      if (nameEl) {
+        var rawName = txt(nameEl);
+        if (rawName && !/^company$/i.test(rawName) && rawName.length < 160) {
+          company = rawName;
+        }
+      }
+      // ---- Phone ----
+      // First <a href="tel:..."> inside the section.
+      var telA = companySection.querySelector('a[href^="tel:"]');
+      if (telA) {
+        var phT = qt(telA.textContent);
+        var pm = phT.match(/\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/);
+        phone = pm ? pm[0] : phT;
+      }
+      // ---- Email ----
+      // First <a href="mailto:..."> inside the section, or pattern match.
+      var mailA = companySection.querySelector('a[href^="mailto:"]');
+      if (mailA) {
+        var emT = qt(mailA.textContent);
+        if (/@/.test(emT)) email = emT;
+      }
+      // ---- MC# / Email backstops ----
+      var compText = companySection.innerText || companySection.textContent || "";
+      if (!mc) {
+        var mcM = compText.match(/\bMC\s*#?\s*(\d{4,})/i);
+        if (mcM) mc = mcM[1];
+      }
+      if (!email) {
+        var emM = compText.match(/[\w.+\-]+@[\w\-]+\.[\w.]{2,}/i);
+        if (emM) email = emM[0];
+      }
+    }
+
+    // ---- Broker diagnostic log ----
+    try {
+      log("[DAT Share Broker] Company section found:", !!companySection);
+      log("[DAT Share Broker] Extracted broker:", {
+        brokerName: company,
+        mcNumber:   mc,
+        phone:      phone,
+        email:      email
+      });
+    } catch (brokerLogErr) {}
+
+    // ===== CONTACT INFORMATION: backfill phone / email =====
+    var contactSection = loadRoot.querySelector('[data-test="contact-information-container"]')
+                      || loadRoot.querySelector('dat-contacts');
+    if (contactSection) {
+      if (!phone) {
+        var phEl = contactSection.querySelector(".contacts__phone")
+                || contactSection.querySelector('a[href^="tel:"]');
+        if (phEl) {
+          var phT2 = qt(phEl.textContent);
+          var pm2 = phT2.match(/\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/);
+          phone = pm2 ? pm2[0] : phT2;
+        }
+      }
+      if (!email) {
+        var emEl = contactSection.querySelector(".contacts__email")
+                || contactSection.querySelector('a[href^="mailto:"]');
+        if (emEl) {
+          var emT = qt(emEl.textContent);
+          if (/@/.test(emT)) email = emT;
+        }
+      }
+    }
+
+    // ===== COMMENTS =====
+    var comments = null;
+    var commentsSection = loadRoot.querySelector('[data-test="comments-container"]')
+                       || loadRoot.querySelector('dat-notes');
+    if (commentsSection) {
+      var notesContents = commentsSection.querySelector(".notes-contents");
+      if (notesContents) comments = txt(notesContents);
+    }
+
+    // ===== Last-resort text fallbacks for anything still null =====
+    var allText = (loadRoot.innerText || loadRoot.textContent || "").replace(/\r\n/g, "\n");
+
+    var KNOWN_LABEL_RE = /^(?:Load|Truck|Length|Weight|Commodity|Reference(?:\s*ID)?|Equipment|Broker|Company|Comments?|Phone|Email|MC#?|Trip|Rate|Total|Pickup|Delivery|Origin|Destination|Date|Empty|DH-?O|DH-?D|Drop|View\s*Route|Market\s*Rates?|Spot\s*Rate|Contract\s*Rate|Days?\s*to\s*Pay|Credit\s*Score|Tracking\s*Required|Load\s*Resources|Insurance|DAT\s*Assurance|Per\s*Load\s*Insurance|Mark\s*As|Rate\s*\/\s*mile|Contact\s*Information)$/i;
+    function clean(v) {
+      if (v == null) return null;
+      var t = qt(String(v));
+      if (!t) return null;
+      if (/^[\-–—\s]+$/.test(t)) return null;
+      if (KNOWN_LABEL_RE.test(t)) return null;
+      return t;
+    }
+
+    if (!origin || !destination) {
+      var glb = /([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+)*,\s*[A-Z]{2})\b/g;
+      var allLocs = [];
+      var glbM;
+      while ((glbM = glb.exec(allText)) !== null) {
+        var l = qt(glbM[1]);
+        if (l && allLocs.indexOf(l) === -1) allLocs.push(l);
+        if (allLocs.length >= 2) break;
+      }
+      if (!origin)      origin      = allLocs[0] || null;
+      if (!destination) destination = allLocs[1] || null;
+    }
+    if (!pickupDate) {
+      var gd = allText.match(/\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:,?\s+(?:19|20)\d{2})?)\b/i)
+            || allText.match(/\b(\d{1,2}\/\d{1,2}(?:\/\d{2,4})?)\b/);
+      if (gd) pickupDate = qt(gd[1]);
+    }
+    if (!tripMiles && hdrTripMiles) {
+      var hm = hdrTripMiles.match(/([\d,]+)/);
+      if (hm) tripMiles = hm[1].replace(/,/g, "") + " mi";
+    }
+    if (!rate) {
+      var totalRateM = allText.match(/\bTotal\s+\$([\d,]+(?:\.\d+)?)/i);
+      if (totalRateM) rate = "$" + totalRateM[1];
+    }
+    if (!tripMiles) {
+      var tripM = allText.match(/\bTrip\s+([\d,]+)\s*mi\b/i);
+      if (tripM) tripMiles = tripM[1] + " mi";
+    }
+    if (!ratePerMile) {
+      var rpmM = allText.match(/\$([\d.]+)\s*\*?\s*\/\s*mi\b/i);
+      if (rpmM) ratePerMile = "$" + rpmM[1] + "/mi";
+    }
+    if (!mc) {
+      var mcM = allText.match(/\bMC\s*#?\s*(\d{4,})/i);
+      if (mcM) mc = mcM[1];
+    }
+    if (!phone) {
+      var phM = allText.match(/\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/);
+      if (phM) phone = phM[0];
+    }
+    if (!email) {
+      var emM = allText.match(/[\w.+\-]+@[\w\-]+\.[\w.]{2,}/i);
+      if (emM) email = emM[0];
+    }
+
+    // ===== Override price / miles / RPM with row parser data =====
+    // Row parser is the canonical source — same data that powers the
+    // T/R helper, filtering and eligibility. The share card MUST show
+    // the same numbers the dispatcher sees on the row badge.
+    if (rowData) {
+      if (Number.isFinite(rowData.price)) {
+        rate = "$" + rowData.price.toLocaleString("en-US");
+      }
+      if (Number.isFinite(rowData.tripMiles)) {
+        tripMiles = rowData.tripMiles + " mi";
+      }
+      if (Number.isFinite(rowData.rpm)) {
+        ratePerMile = "$" + rowData.rpm.toFixed(2) + "/mi";
+      }
+      if (Number.isFinite(rowData.emptyPickMiles)) {
+        dhOriginRaw = String(rowData.emptyPickMiles);
+      }
+      if (Number.isFinite(rowData.dropEmptyMiles)) {
+        dhDropRaw = String(rowData.dropEmptyMiles);
+      }
+    }
+
+    // ===== Derived: total miles, total RPM =====
+    function toNum(v) {
+      if (v == null) return null;
+      var m = String(v).match(/[\d.,]+/);
+      if (!m) return null;
+      var n = parseFloat(m[0].replace(/,/g, ""));
+      return Number.isFinite(n) ? n : null;
+    }
+    var tripMilesNum = toNum(tripMiles);
+    var dhOriginNum  = toNum(dhOriginRaw);
+    var dhDropNum    = toNum(dhDropRaw);
+    var rateNum      = toNum(rate);
+    var totalMilesNum = null;
+    if (Number.isFinite(tripMilesNum) && tripMilesNum > 0) {
+      totalMilesNum = tripMilesNum
+        + (Number.isFinite(dhOriginNum) ? dhOriginNum : 0)
+        + (Number.isFinite(dhDropNum)   ? dhDropNum   : 0);
+    }
+    var totalMiles = Number.isFinite(totalMilesNum) ? (totalMilesNum + " mi") : null;
+    var totalRpm   = (Number.isFinite(rateNum) && Number.isFinite(totalMilesNum) && totalMilesNum > 0)
+      ? ("$" + (rateNum / totalMilesNum).toFixed(2) + "/mi")
+      : null;
+
+    // Prefer the row parser's pre-computed totals so the share card
+    // displays exactly what the T/R helper shows — single source of truth.
+    if (rowData) {
+      if (Number.isFinite(rowData.totalMiles)) {
+        totalMiles = rowData.totalMiles + " mi";
+      }
+      if (Number.isFinite(rowData.totalRpm)) {
+        totalRpm = "$" + rowData.totalRpm.toFixed(2) + "/mi";
+      }
+    }
+
+    // ===== Assemble result =====
+    var result = {
+      origin:      clean(origin),
+      destination: clean(destination),
+      pickupDate:  clean(pickupDate),
+      rate:        clean(rate),
+      ratePerMile: clean(ratePerMile),
+      tripMiles:   clean(tripMiles),
+      dhOrigin:    dhOriginRaw != null ? (dhOriginRaw + " mi") : null,
+      dhDrop:      dhDropRaw   != null ? (dhDropRaw   + " mi") : null,
+      totalMiles:  totalMiles,
+      totalRpm:    totalRpm,
+      loadType:    clean(loadType),
+      truck:       clean(truck),
+      length:      clean(length),
+      weight:      clean(weight),
+      commodity:   clean(commodity),
+      referenceId: clean(referenceId),
+      company:     clean(company),
+      mc:          clean(mc),
+      phone:       clean(phone),
+      email:       clean(email),
+      comments:    clean(comments)
+    };
+
+    // ===== Diagnostic logs =====
+    try {
+      log("[DAT Share Card] Using shared row parser values:", rowData ? {
+        price:           rowData.price,
+        tripMiles:       rowData.tripMiles,
+        emptyPickMiles:  rowData.emptyPickMiles,
+        emptyDropMiles:  rowData.dropEmptyMiles,
+        totalMiles:      rowData.totalMiles,
+        rpm:             rowData.rpm,
+        totalRpm:        rowData.totalRpm
+      } : "(row parser unavailable — using panel extraction only)");
+      log("[DAT Share Card] Using expanded panel values:", {
+        truck:       truck,
+        length:      length,
+        weight:      weight,
+        loadType:    loadType,
+        commodity:   commodity,
+        referenceId: referenceId,
+        company:     company,
+        mc:          mc,
+        phone:       phone,
+        email:       email,
+        comments:    comments
+      });
+      log("[DAT Share Extract] sections located:", {
+        header:    !!detailsHeader,
+        route:     !!routeSection,
+        equipment: !!eqSection,
+        rate:      !!rateSection,
+        company:   !!companySection,
+        contact:   !!contactSection,
+        comments:  !!commentsSection
+      });
+      log("[DAT Share Extract] equipment map:", eqMap);
+      log("[DAT Share Extract] final:", result);
+    } catch (e) {}
+
+    return result;
+  }
+
+  // ------------------------------------------------------------------
+  // SHARE CARD — PRESENCE CHECK
+  //
+  // Bail with a friendly toast if extraction couldn't find any of the
+  // load fields a dispatcher would actually want to share.
+  // ------------------------------------------------------------------
+  function hasUsefulLoadData(d) {
+    if (!d) return false;
+    return !!(d.origin || d.destination || d.rate || d.tripMiles ||
+              d.totalMiles || d.company || d.truck || d.length ||
+              d.weight || d.commodity || d.phone || d.email || d.comments);
+  }
+
+  // ------------------------------------------------------------------
+  // SHARE CARD — DIRECT CANVAS RENDERER
+  //
+  // Earlier revisions of this feature built a real DOM element and
+  // rasterised it via an inline <svg><foreignObject>HTML</foreignObject></svg>
+  // Image. That approach worked in isolation but failed on one.dat.com:
+  // Chromium taints any canvas that draws a foreignObject SVG
+  // containing HTML, so canvas.toBlob() throws a SecurityError and the
+  // clipboard write never fires.
+  //
+  // Direct canvas drawing sidesteps the whole problem — no SVG, no
+  // blob: URL, no Image load, no taint, no CSP exposure. Everything
+  // is laid out by walking a list of blocks twice (measure → paint).
+  //
+  // Output: a Promise<Blob> of an image/png ready for ClipboardItem.
+  // ------------------------------------------------------------------
+  function renderShareCardBlob(d) {
+    return new Promise(function(resolve, reject) {
+      try {
+        // ================ Visual constants ================
+        var DPR    = 2;     // pixel ratio for crisp output on retina/mobile
+        var W      = 820;   // logical width — fits comfortably in WhatsApp
+        var PADX   = 36;
+        var PADTOP = 28;
+        var PADBOT = 28;
+
+        // Combined family puts system UI fonts first and a chain of
+        // color-emoji fonts after. Canvas picks the first family that
+        // has a glyph for each character, so latin glyphs come from
+        // the UI font and emoji glyphs from the installed emoji font.
+        var FAMILY =
+          "-apple-system, BlinkMacSystemFont, 'Segoe UI', " +
+          "'Helvetica Neue', Arial, " +
+          "'Segoe UI Emoji', 'Apple Color Emoji', " +
+          "'Noto Color Emoji', sans-serif";
+
+        var ROW_H               = 28;
+        var SECTION_TOP_GAP     = 16;
+        var SECTION_DIVIDER_GAP = 16;
+        var SECTION_TITLE_H     = 14;
+        var SECTION_TITLE_BOT   = 12;
+        var HEADER_ROUTE_H      = 34;
+        var HEADER_SUB_H        = 22;
+        var HEADER_BOT_GAP      = 4;
+        var COMMENTS_BOX_PADX   = 16;
+        var COMMENTS_BOX_PADY   = 12;
+        var COMMENTS_LINE_H     = 21;
+        var CARD_RADIUS         = 14;
+
+        // Palette — modern flat dispatch look.
+        var COLOR_BG          = "#ffffff";
+        var COLOR_BORDER      = "#e2e8f0";
+        var COLOR_TEXT_STRONG = "#0f172a";
+        var COLOR_TEXT_BODY   = "#334155";
+        var COLOR_TEXT_MUTED  = "#64748b";
+        var COLOR_TEXT_SUB    = "#475569";
+        var COLOR_COMMENTS_BG = "#f8fafc";
+        var COLOR_ACCENT      = "#3b82f6";
+
+        // ================ Formatting helpers ================
+        // Every extracted field goes through these so the card has a
+        // consistent shape. Missing values become "N/A" except for
+        // empty-pickup / empty-drop miles, which default to "0 mi"
+        // (a load with zero deadhead is meaningful — "N/A" would be
+        // wrong). RPM / Total / Total RPM are gated on whether trip
+        // and price look valid: if either is missing we force N/A so
+        // the dispatcher never reads a derived number we can't trust.
+        function isBlank(v) {
+          if (v === undefined || v === null) return true;
+          var s = String(v).trim();
+          if (!s) return true;
+          if (/^[\-–—\s]+$/.test(s)) return true; // dashes only
+          return false;
+        }
+        function formatMoney(v) {
+          if (isBlank(v)) return null;
+          var m = String(v).match(/[\d.,]+/);
+          if (!m) return null;
+          var n = parseFloat(m[0].replace(/,/g, ""));
+          if (!Number.isFinite(n)) return null;
+          return "$" + Math.round(n).toLocaleString("en-US");
+        }
+        function formatMiles(v) {
+          if (isBlank(v)) return null;
+          var m = String(v).match(/[\d.,]+/);
+          if (!m) return null;
+          var n = parseFloat(m[0].replace(/,/g, ""));
+          if (!Number.isFinite(n)) return null;
+          return Math.round(n).toLocaleString("en-US") + " mi";
+        }
+        function formatRate(v) {
+          if (isBlank(v)) return null;
+          var m = String(v).match(/[\d.]+/);
+          if (!m) return null;
+          var n = parseFloat(m[0]);
+          if (!Number.isFinite(n)) return null;
+          return n.toFixed(2);
+        }
+        function plain(v) {
+          return isBlank(v) ? null : String(v).trim();
+        }
+        function fallback(v, fb) {
+          return v == null ? (fb == null ? "N/A" : fb) : v;
+        }
+
+        // ================ Normalised values ================
+        var origin       = plain(d.origin);
+        var destination  = plain(d.destination);
+        var route;
+        if (origin && destination) {
+          route = origin + "  →  " + destination;
+        } else if (origin) {
+          route = origin + "  →  N/A";
+        } else if (destination) {
+          route = "N/A  →  " + destination;
+        } else {
+          route = "N/A";
+        }
+
+        var pickup       = fallback(plain(d.pickupDate));
+        var rateFmt      = formatMoney(d.rate);
+        var tripFmt      = formatMiles(d.tripMiles);
+        var emptyPkFmt   = fallback(formatMiles(d.dhOrigin),   "0 mi");
+        var emptyDrFmt   = fallback(formatMiles(d.dhDrop),     "0 mi");
+
+        // Derived values — gate on the inputs being trustworthy.
+        var tripOk  = tripFmt != null;
+        var priceOk = rateFmt != null;
+        var totalFmt    = tripOk            ? fallback(formatMiles(d.totalMiles))   : "N/A";
+        var rpmFmt      = (tripOk && priceOk) ? fallback(formatRate(d.ratePerMile)) : "N/A";
+        var totalRpmFmt = (tripOk && priceOk) ? fallback(formatRate(d.totalRpm))    : "N/A";
+
+        // Apply the rate / trip fallbacks AFTER the derived gating so
+        // the gating sees the raw availability, not the "N/A" string.
+        var rateDisp     = fallback(rateFmt);
+        var tripDisp     = fallback(tripFmt);
+
+        var truckFmt     = fallback(plain(d.truck));
+        var lengthFmt    = fallback(plain(d.length));
+        var weightFmt    = fallback(plain(d.weight));
+        var loadFmt      = fallback(plain(d.loadType));
+        var commodFmt    = fallback(plain(d.commodity));
+        var refIdFmt     = fallback(plain(d.referenceId));
+        var brokerFmt    = fallback(plain(d.company));
+        var mcFmt        = fallback(plain(d.mc));
+        var phoneFmt     = fallback(plain(d.phone));
+        var emailFmt     = fallback(plain(d.email));
+        var commentsRaw  = plain(d.comments);
+
+        function row(label, value, emoji) {
+          return { label: label, value: value, emoji: emoji || "" };
+        }
+
+        // ================ Build blocks — every section ALWAYS emits ================
+        var blocks = [];
+
+        // Header — route + pickup, always present.
+        blocks.push({ kind: "header", route: route, pickup: pickup });
+
+        // Load Details — 7 rows, always present.
+        blocks.push({ kind: "section", title: "LOAD DETAILS", rows: [
+          row("Rate",         rateDisp,    "\u{1F4B5}"),
+          row("Trip",         tripDisp,    "\u{1F69A}"),
+          row("Empty Pickup", emptyPkFmt,  "\u{1F4CD}"),
+          row("Empty Drop",   emptyDrFmt,  "\u{1F4CD}"),
+          row("Total",        totalFmt,    "\u{1F6E3}"),
+          row("RPM",          rpmFmt,      "\u{1F4C8}"),
+          row("Total RPM",    totalRpmFmt, "\u{1F4C8}")
+        ]});
+
+        // Equipment — 6 rows, always present.
+        blocks.push({ kind: "section", title: "EQUIPMENT", rows: [
+          row("Truck",        truckFmt),
+          row("Length",       lengthFmt),
+          row("Weight",       weightFmt),
+          row("Load",         loadFmt),
+          row("Commodity",    commodFmt),
+          row("Reference ID", refIdFmt)
+        ]});
+
+        // Broker — 4 rows, always present.
+        blocks.push({ kind: "section", title: "BROKER", rows: [
+          row("Broker", brokerFmt),
+          row("MC",     mcFmt),
+          row("Phone",  phoneFmt),
+          row("Email",  emailFmt)
+        ]});
+
+        // Comments — word-wrap pre-computed with a measuring canvas
+        // so the total card height is known before we allocate the
+        // bitmap. Embedded newlines are preserved as paragraph breaks.
+        // The section is always emitted; "N/A" fills in when missing.
+        var measure = document.createElement("canvas").getContext("2d");
+        function wrapText(text, font, maxWidth) {
+          measure.font = font;
+          var paragraphs = String(text).split(/\r?\n/);
+          var out = [];
+          for (var pi = 0; pi < paragraphs.length; pi++) {
+            var words = paragraphs[pi].split(/\s+/).filter(Boolean);
+            if (!words.length) { out.push(""); continue; }
+            var cur = words[0];
+            for (var wi = 1; wi < words.length; wi++) {
+              var trial = cur + " " + words[wi];
+              if (measure.measureText(trial).width <= maxWidth) {
+                cur = trial;
+              } else {
+                out.push(cur);
+                cur = words[wi];
+              }
+            }
+            out.push(cur);
+          }
+          return out;
+        }
+
+        var commentsFont = "400 14px " + FAMILY;
+        var commentsMaxW = W - PADX * 2 - COMMENTS_BOX_PADX * 2;
+        var commentsLines = wrapText(
+          commentsRaw == null ? "N/A" : commentsRaw,
+          commentsFont,
+          commentsMaxW
+        );
+        if (!commentsLines.length) commentsLines = ["N/A"];
+        blocks.push({ kind: "comments", lines: commentsLines });
+
+        // ================ Layout pass: total height ================
+        function blockHeight(b) {
+          if (b.kind === "header") {
+            var h = 0;
+            if (b.route)  h += HEADER_ROUTE_H;
+            if (b.pickup) h += HEADER_SUB_H;
+            h += HEADER_BOT_GAP;
+            return h;
+          }
+          if (b.kind === "section") {
+            return SECTION_TOP_GAP + SECTION_DIVIDER_GAP +
+                   SECTION_TITLE_H + SECTION_TITLE_BOT +
+                   b.rows.length * ROW_H;
+          }
+          if (b.kind === "comments") {
+            var boxH = COMMENTS_BOX_PADY * 2 + b.lines.length * COMMENTS_LINE_H;
+            return SECTION_TOP_GAP + SECTION_DIVIDER_GAP +
+                   SECTION_TITLE_H + SECTION_TITLE_BOT + boxH;
+          }
+          return 0;
+        }
+
+        var H = PADTOP;
+        for (var bi = 0; bi < blocks.length; bi++) H += blockHeight(blocks[bi]);
+        H += PADBOT;
+
+        // ================ Allocate canvas ================
+        var canvas = document.createElement("canvas");
+        canvas.width  = Math.round(W * DPR);
+        canvas.height = Math.round(H * DPR);
+        var ctx = canvas.getContext("2d");
+        ctx.scale(DPR, DPR);
+        ctx.textBaseline = "top";
+
+        function roundRect(x, y, w, h, r) {
+          ctx.beginPath();
+          if (typeof ctx.roundRect === "function") {
+            ctx.roundRect(x, y, w, h, r);
+            return;
+          }
+          ctx.moveTo(x + r, y);
+          ctx.arcTo(x + w, y,     x + w, y + h, r);
+          ctx.arcTo(x + w, y + h, x,     y + h, r);
+          ctx.arcTo(x,     y + h, x,     y,     r);
+          ctx.arcTo(x,     y,     x + w, y,     r);
+          ctx.closePath();
+        }
+
+        // ================ Paint ================
+        // Solid white outer fill so the corners read intentionally
+        // when the PNG is pasted onto dark-mode messaging apps.
+        ctx.fillStyle = COLOR_BG;
+        ctx.fillRect(0, 0, W, H);
+
+        // Card border — half-pixel offset keeps the 1px stroke sharp.
+        roundRect(0.5, 0.5, W - 1, H - 1, CARD_RADIUS);
+        ctx.strokeStyle = COLOR_BORDER;
+        ctx.lineWidth   = 1;
+        ctx.stroke();
+
+        function drawDivider(yy) {
+          ctx.strokeStyle = COLOR_BORDER;
+          ctx.lineWidth   = 1;
+          ctx.beginPath();
+          var yLine = Math.round(yy) + 0.5;
+          ctx.moveTo(PADX, yLine);
+          ctx.lineTo(W - PADX, yLine);
+          ctx.stroke();
+        }
+
+        var y = PADTOP;
+
+        for (var bj = 0; bj < blocks.length; bj++) {
+          var blk = blocks[bj];
+
+          if (blk.kind === "header") {
+            if (blk.route) {
+              ctx.font      = "700 24px " + FAMILY;
+              ctx.fillStyle = COLOR_TEXT_STRONG;
+              ctx.textAlign = "left";
+              ctx.fillText("\u{1F4CD}  " + blk.route, PADX, y);
+              y += HEADER_ROUTE_H;
+            }
+            if (blk.pickup) {
+              ctx.font      = "500 14px " + FAMILY;
+              ctx.fillStyle = COLOR_TEXT_SUB;
+              ctx.textAlign = "left";
+              ctx.fillText("Pickup: " + blk.pickup, PADX, y);
+              y += HEADER_SUB_H;
+            }
+            y += HEADER_BOT_GAP;
+            continue;
+          }
+
+          // Section header (used for both 'section' and 'comments')
+          y += SECTION_TOP_GAP;
+          drawDivider(y);
+          y += SECTION_DIVIDER_GAP;
+          ctx.font      = "700 11px " + FAMILY;
+          ctx.fillStyle = COLOR_TEXT_MUTED;
+          ctx.textAlign = "left";
+          var title = blk.kind === "comments" ? "COMMENTS" : blk.title;
+          ctx.fillText(title, PADX, y);
+          y += SECTION_TITLE_H + SECTION_TITLE_BOT;
+
+          if (blk.kind === "section") {
+            for (var ri = 0; ri < blk.rows.length; ri++) {
+              var rowItem = blk.rows[ri];
+              // Left: optional emoji + label
+              ctx.font      = "500 15px " + FAMILY;
+              ctx.fillStyle = COLOR_TEXT_BODY;
+              ctx.textAlign = "left";
+              var leftText = rowItem.emoji
+                ? (rowItem.emoji + "  " + rowItem.label)
+                : rowItem.label;
+              ctx.fillText(leftText, PADX, y);
+              // Right: value, right-aligned
+              ctx.font      = "600 15px " + FAMILY;
+              ctx.fillStyle = COLOR_TEXT_STRONG;
+              ctx.textAlign = "right";
+              ctx.fillText(rowItem.value, W - PADX, y);
+              y += ROW_H;
+            }
+          } else {
+            // Comments box — soft slate background with blue accent.
+            var boxX = PADX;
+            var boxY = y;
+            var boxW = W - PADX * 2;
+            var boxH = COMMENTS_BOX_PADY * 2 + blk.lines.length * COMMENTS_LINE_H;
+            roundRect(boxX, boxY, boxW, boxH, 8);
+            ctx.fillStyle = COLOR_COMMENTS_BG;
+            ctx.fill();
+            // Left accent stripe, clipped to the round-rect so it
+            // follows the box's left corners cleanly.
+            ctx.save();
+            roundRect(boxX, boxY, boxW, boxH, 8);
+            ctx.clip();
+            ctx.fillStyle = COLOR_ACCENT;
+            ctx.fillRect(boxX, boxY, 4, boxH);
+            ctx.restore();
+            // Text
+            ctx.font      = "400 14px " + FAMILY;
+            ctx.fillStyle = COLOR_TEXT_BODY;
+            ctx.textAlign = "left";
+            for (var cli = 0; cli < blk.lines.length; cli++) {
+              ctx.fillText(
+                blk.lines[cli],
+                boxX + COMMENTS_BOX_PADX,
+                boxY + COMMENTS_BOX_PADY + cli * COMMENTS_LINE_H
+              );
+            }
+            y += boxH;
+          }
+        }
+
+        // ================ Export ================
+        canvas.toBlob(function(blob) {
+          if (blob) resolve(blob);
+          else reject(new Error("canvas.toBlob returned null"));
+        }, "image/png");
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  function showShareToast(message, isError) {
+    try {
+      // Reuse a single toast node so rapid clicks don't pile up.
+      var toast = document.querySelector("." + SHARE_TOAST_CLASS);
+      if (!toast) {
+        toast = document.createElement("div");
+        toast.className = "dat-helper-toast " + SHARE_TOAST_CLASS;
+        toast.setAttribute(EXTENSION_ATTRIBUTE, "true");
+        document.body.appendChild(toast);
+      }
+      toast.classList.toggle("dat-helper-toast-error", !!isError);
+      toast.textContent = message;
+      // Force a reflow so the entry transition runs even when reusing.
+      void toast.offsetWidth;
+      toast.classList.add("dat-helper-toast-visible");
+      window.clearTimeout(toast._datHelperHideTimer);
+      toast._datHelperHideTimer = window.setTimeout(function() {
+        toast.classList.remove("dat-helper-toast-visible");
+      }, 2400);
+    } catch (e) {
+      warn(SHARE_LOG, "toast failed:", e);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // SHARE CARD — ORCHESTRATION
+  //
+  // Click handler entry point. Renders the card to a PNG via direct
+  // canvas drawing (no DOM mount, no SVG, no taint risk) and copies
+  // the PNG to the clipboard as image/png. The user then pastes the
+  // image into WhatsApp / iMessage / Telegram / Slack / email /
+  // Discord via Ctrl+V.
+  //
+  // Clipboard nuance: navigator.clipboard.write() is gated on user
+  // activation. We call it synchronously inside the click handler
+  // with a ClipboardItem whose value is a Promise<Blob>; the browser
+  // awaits the blob itself while the permission grant stays anchored
+  // to the original click. Browsers that don't accept a Promise-
+  // valued ClipboardItem throw synchronously, in which case we fall
+  // back to awaiting the blob first and writing it directly (same
+  // user gesture, just less robust under strict activation rules).
+  // ------------------------------------------------------------------
+  function generateAndCopyLoadCard(data, btn) {
+    if (!hasUsefulLoadData(data)) {
+      showShareToast("Couldn't read load details", true);
+      return Promise.resolve();
+    }
+    if (!window.ClipboardItem ||
+        !navigator.clipboard ||
+        typeof navigator.clipboard.write !== "function") {
+      warn(SHARE_LOG, "Clipboard image API not available in this browser");
+      showShareToast("Clipboard image copy not supported here", true);
+      return Promise.resolve();
+    }
+
+    log(SHARE_LOG, "Building share card");
+
+    // ---- Diagnostic logs ----
+    // Lets the dispatcher inspect exactly what extraction surfaced
+    // from the expanded panel, plus a quick "missing fields" list so
+    // it's obvious which DAT rows didn't yield a value this run.
+    try {
+      log("[DAT Share Card] Extracted load details:", data);
+      var DATA_KEYS = [
+        "origin", "destination", "pickupDate",
+        "rate", "ratePerMile", "tripMiles",
+        "dhOrigin", "dhDrop", "totalMiles", "totalRpm",
+        "loadType", "truck", "length", "weight",
+        "commodity", "referenceId",
+        "company", "mc", "phone", "email", "comments"
+      ];
+      var missingFields = [];
+      for (var dk = 0; dk < DATA_KEYS.length; dk++) {
+        var k = DATA_KEYS[dk];
+        var v = data && data[k];
+        if (v === undefined || v === null ||
+            (typeof v === "string" && v.trim() === "")) {
+          missingFields.push(k);
+        }
+      }
+      if (missingFields.length) {
+        log("[DAT Share Card] Missing fields:", missingFields.join(", "));
+      }
+    } catch (logErr) {
+      // Logging must never break the share flow.
+      warn(SHARE_LOG, "diagnostic log failed:", logErr);
+    }
+
+    function flashSuccess() {
+      showShareToast("✅ Load card copied");
+      if (btn instanceof HTMLElement) {
+        var labelSpan = btn.querySelector("span:last-child");
+        var orig = labelSpan ? labelSpan.textContent : null;
+        if (labelSpan) labelSpan.textContent = "Copied!";
+        window.setTimeout(function() {
+          if (labelSpan && orig != null) labelSpan.textContent = orig;
+        }, 1400);
+      }
+    }
+
+    var blobPromise = renderShareCardBlob(data).then(function(blob) {
+      log(SHARE_LOG, "Canvas rendered");
+      return blob;
+    });
+
+    // Primary path: pass the Promise<Blob> straight into ClipboardItem
+    // so the browser preserves user activation across the async render.
+    var writePromise;
+    try {
+      writePromise = navigator.clipboard.write([
+        new ClipboardItem({ "image/png": blobPromise })
+      ]);
+    } catch (ctorErr) {
+      // Fallback: await the blob ourselves, then write. Same user
+      // gesture, just less robust on browsers with strict activation.
+      writePromise = blobPromise.then(function(blob) {
+        return navigator.clipboard.write([
+          new ClipboardItem({ "image/png": blob })
+        ]);
+      });
+    }
+
+    return writePromise
+      .then(function() {
+        log(SHARE_LOG, "Clipboard image copied");
+        flashSuccess();
+      })
+      .catch(function(err) {
+        warn(SHARE_LOG, "image copy failed:", err);
+        showShareToast("Clipboard image copy failed", true);
+      });
+  }
+
+  // ------------------------------------------------------------------
+  // LIFECYCLE — observer that injects share buttons into expanded panels
+  // ------------------------------------------------------------------
+  var shareObserver = null;
+  var shareInjectScheduled = false;
+  function scheduleShareInject() {
+    if (shareInjectScheduled) return;
+    shareInjectScheduled = true;
+    // Coalesce DOM-mutation bursts into a single injection pass per
+    // animation frame. This keeps the observer cheap during DAT's own
+    // re-renders while still updating before the next paint.
+    var run = function() {
+      shareInjectScheduled = false;
+      try {
+        injectShareButtons();
+      } catch (e) {
+        warn(SHARE_LOG, "inject failed:", e);
+      }
+    };
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(run);
+    } else {
+      window.setTimeout(run, 16);
+    }
+  }
+
+  function startShareLoadFeature() {
+    if (!document.body) {
+      // Body isn't ready yet — wait for DOMContentLoaded then retry.
+      document.addEventListener(
+        "DOMContentLoaded",
+        function once() {
+          document.removeEventListener("DOMContentLoaded", once);
+          startShareLoadFeature();
+        },
+        { once: true }
+      );
+      return;
+    }
+    // Idempotent: never start a second observer.
+    if (shareObserver) {
+      scheduleShareInject();
+      return;
+    }
+    shareObserver = new MutationObserver(function(mutations) {
+      // Cheap filter: only react when nodes are added/removed. Attribute
+      // mutations on existing nodes don't expand/collapse panels.
+      for (var i = 0; i < mutations.length; i++) {
+        var m = mutations[i];
+        if (m.type === "childList" && (m.addedNodes.length || m.removedNodes.length)) {
+          scheduleShareInject();
+          return;
+        }
+      }
+    });
+    shareObserver.observe(document.body, { childList: true, subtree: true });
+    // Initial pass for any panels already expanded when the feature starts.
+    scheduleShareInject();
+    log(SHARE_LOG, "started");
+  }
+
+  function stopShareLoadFeature() {
+    if (shareObserver) {
+      try { shareObserver.disconnect(); } catch (_) {}
+      shareObserver = null;
+    }
+    shareInjectScheduled = false;
+    // Remove any of our buttons + unwrap action stacks. DAT's own VIEW
+    // ROUTE button is preserved inside unwrapActionStacks().
+    try {
+      var buttons = document.querySelectorAll(
+        '[' + EXTENSION_ATTRIBUTE + '="true"][data-dat-helper-role="' + SHARE_BTN_ROLE + '"]'
+      );
+      for (var i = 0; i < buttons.length; i++) {
+        if (buttons[i].parentNode) buttons[i].parentNode.removeChild(buttons[i]);
+      }
+    } catch (e) {
+      warn(SHARE_LOG, "button cleanup failed:", e);
+    }
+    try { unwrapActionStacks(); } catch (e) { warn(SHARE_LOG, "unwrap failed:", e); }
+    // Drop any toast we left behind so the page is fully restored.
+    try {
+      var toast = document.querySelector("." + SHARE_TOAST_CLASS);
+      if (toast && toast.parentNode) toast.parentNode.removeChild(toast);
+    } catch (_) {}
+    log(SHARE_LOG, "stopped");
+  }
+
+  // Wire up the lifecycle placeholders defined near the top of the IIFE
+  // so applyCurrentState() / cleanup actually drive this feature.
+  shareLoad.start = startShareLoadFeature;
+  shareLoad.stop  = stopShareLoadFeature;
 })();

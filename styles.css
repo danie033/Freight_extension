@@ -129,3 +129,198 @@ html.dat-helper-active
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.3);
   white-space: pre-line;
 }
+
+/* =====================================================================
+   Share Load Card — button injected below VIEW ROUTE in expanded panels
+   ===================================================================== */
+
+/* Action stack: a vertical column wrapper that takes the place of DAT's
+   VIEW ROUTE button in the expanded panel. The original button is moved
+   inside, and the Share Load button is appended below it. This is what
+   keeps Share Load from overlapping the trip timeline / pickup text /
+   VIEW ROUTE button itself — DAT's row uses a horizontal flex layout,
+   and our stack is a flex column inside that slot.
+
+   Defensive resets: DAT's surrounding container is a flex / inline-flex
+   row, so we use `flex-direction: column` with `!important` to keep the
+   children stacked even if some parent rule tries to flip us back to a
+   row. `min-width: 100%` on direct children prevents the column from
+   collapsing into a narrow strip that would let the share button slide
+   up next to VIEW ROUTE. */
+.dat-helper-action-stack {
+  /* inline-flex matches a typical button's inline-block flow, so when
+     the stack replaces the VIEW ROUTE pill in a flex row it occupies
+     the same kind of slot. */
+  display: inline-flex !important;
+  flex-direction: column !important;
+  flex-wrap: nowrap !important;
+  /* Center the children horizontally so the Share Load button sits
+     centered under the VIEW ROUTE pill, regardless of whether the two
+     pills are the same width. */
+  align-items: center !important;
+  justify-content: flex-start !important;
+  /* 8px vertical spacing between VIEW ROUTE and the Share Load button. */
+  gap: 8px !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  /* fit-content keeps the column tight to the widest child (the VIEW
+     ROUTE pill), so the stack occupies the same horizontal slot the
+     original button did and never spills under the trip text. */
+  width: fit-content !important;
+  max-width: 100% !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  /* The stack must always be visible — even if an ancestor sets
+     overflow: hidden, the actual button sits inside this wrapper and
+     overflow:visible here keeps the share button paintable. */
+  overflow: visible !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  /* Reset anything DAT might have put on the original button's parent
+     slot, so the stack sits in normal flow without absolute / translate
+     positioning hacks. */
+  position: static !important;
+  top: auto !important;
+  left: auto !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: none !important;
+  float: none !important;
+  clip: auto !important;
+  clip-path: none !important;
+  vertical-align: middle;
+  box-sizing: border-box;
+}
+
+/* Each child gets its own row. The VIEW ROUTE pill keeps its original
+   natural width (no stretching), and the Share Load button below sits
+   directly underneath it — never beside it, no matter what DAT's
+   surrounding flex container is doing. */
+.dat-helper-action-stack > * {
+  flex: 0 0 auto !important;
+  width: auto !important;
+  /* No negative margins, no top offsets — the gap above handles spacing. */
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+}
+
+.dat-helper-share-load-btn {
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border-radius: 999px;
+  border: 1.5px solid #cbd5e1 !important;
+  background: #ffffff !important;
+  color: #1e293b !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Arial, sans-serif !important;
+  line-height: 1 !important;
+  cursor: pointer !important;
+  white-space: nowrap;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+  /* Keep the button in normal flow — no relative/absolute positioning,
+     no z-index stacking context. The action-stack column above is what
+     places this below the VIEW ROUTE pill. */
+  position: static !important;
+  top: auto !important;
+  left: auto !important;
+  right: auto !important;
+  bottom: auto !important;
+  transform: none !important;
+  float: none !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  overflow: visible !important;
+  max-height: none !important;
+  height: auto !important;
+  width: auto !important;
+  min-width: 0 !important;
+  /* Self-align center is a belt-and-suspenders for any case where the
+     parent's align-items gets overridden by a more specific DAT rule. */
+  align-self: center !important;
+}
+
+.dat-helper-share-load-btn:hover {
+  background: #f1f5f9 !important;
+  border-color: #94a3b8 !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+}
+
+.dat-helper-share-load-btn:active {
+  background: #e2e8f0 !important;
+}
+
+.dat-helper-share-load-btn:disabled {
+  opacity: 0.55 !important;
+  cursor: not-allowed !important;
+}
+
+/* Narrow viewport: let the share button stretch with the action stack
+   so it doesn't look lost beneath a small VIEW ROUTE pill. The stack
+   stays centered in the trip column either way (align-items: center
+   above), so the button is centered with VIEW ROUTE without absolute
+   positioning or negative margins. */
+@media (max-width: 640px) {
+  .dat-helper-action-stack {
+    width: 100% !important;
+    align-items: stretch !important;
+  }
+  .dat-helper-action-stack > * {
+    width: 100% !important;
+  }
+  .dat-helper-share-load-btn {
+    width: 100% !important;
+    justify-content: center !important;
+    align-self: stretch !important;
+  }
+}
+
+/* Small toast shown after Share Load copies the card to the clipboard
+   (or after the fallback download path runs). Bottom-right, auto-hide. */
+.dat-helper-toast {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483647;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 360px;
+  padding: 10px 14px;
+  border-radius: 10px;
+  background: #0f172a;
+  color: #f8fafc;
+  font: 500 13px/1.4 "Segoe UI", -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+  white-space: normal;
+}
+
+.dat-helper-toast.dat-helper-toast-visible {
+  opacity: 1;
+  transform: translateY(0);
+  pointer-events: auto;
+}
+
+.dat-helper-toast-error {
+  background: #7f1d1d;
+}
+
+.dat-helper-toast a.dat-helper-toast-action {
+  color: #93c5fd;
+  text-decoration: underline;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.dat-helper-toast-error a.dat-helper-toast-action {
+  color: #fecaca;
+}
